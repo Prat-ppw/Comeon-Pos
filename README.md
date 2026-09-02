@@ -23,7 +23,25 @@
 
 ---
 
-## 📺 การตั้งค่า Sunmi D2s Plus (Dual Screen)
+## 🚀 ขั้นตอนการ Build APK อัตโนมัติ (GitHub Actions)
+
+คุณไม่จำเป็นต้องมีเครื่อง Android หรือติดตั้ง Java บนเครื่องตัวเอง เพียงแค่ Push Code ขึ้น GitHub ระบบจะทำการ Build ให้ทันที
+
+### 1. การ Build สำหรับทดสอบ (Debug)
+*   ทุกครั้งที่คุณ `git push` ไปที่กิ่ง `main`
+*   GitHub จะเริ่ม Build อัตโนมัติ (ใช้เวลาประมาณ 10-15 นาที)
+*   ไปที่แท็บ **Actions** ใน GitHub เพื่อดูสถานะ
+*   เมื่อเสร็จแล้ว ดาวน์โหลดไฟล์ได้ที่หัวข้อ **Artifacts** (ชื่อ `brew-pos-debug-apk`)
+
+### 2. การ Build สำหรับใช้งานจริง (Release)
+*   ต้องทำการสร้าง Tag (เช่น `git tag v1.0.0` แล้ว `git push origin v1.0.0`)
+*   GitHub จะสร้างหน้า **Release** และแนบไฟล์ `app-release.apk` ให้โดยอัตโนมัติ
+*   *หมายเหตุ: ต้องตั้งค่า GitHub Secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`) ใน Repository ก่อน*
+
+### 🛠 สิ่งที่ระบบจัดการให้โดยอัตโนมัติ:
+*   Build Web Assets ด้วย Vite
+*   Sync ข้อมูลเข้า Capacitor Android
+*   **Patch สำหรับ Sunmi D2s Plus**: ระบบจะดึงไฟล์จาก `android-config/` ไปทับในโปรเจค Android ให้เอง เพื่อให้รองรับการทำงานแบบ Full Screen และสิทธิ์การใช้เครื่องพิมพ์
 
 เครื่อง Sunmi D2s Plus มี 2 หน้าจอ แอปจะแยกการทำงานอัตโนมัติ:
 
