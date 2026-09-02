@@ -43,9 +43,13 @@ jobs:
       - name: Build web app
         run: npm run build
 
-      # ── 7. Sync Capacitor ──────────────────────────────────────
-      - name: Capacitor sync
-        run: npx cap sync android
+      # ── 7. Add & Sync Capacitor ────────────────────────────────
+      - name: Capacitor Sync
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
 
       # ── 8. Apply Sunmi D2s Plus Patches ────────────────────────
       - name: Apply Sunmi Patches
