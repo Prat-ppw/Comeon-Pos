@@ -50,6 +50,7 @@ jobs:
       # ── 8. Apply Sunmi D2s Plus Patches ────────────────────────
       - name: Apply Sunmi Patches
         run: |
+          mkdir -p android/app/src/main/res/values
           cp android-config/AndroidManifest-patch.xml android/app/src/main/AndroidManifest.xml
           cp android-config/styles-patch.xml android/app/src/main/res/values/styles.xml
 
