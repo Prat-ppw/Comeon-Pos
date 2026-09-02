@@ -1517,7 +1517,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, githubSe
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>GitHub Personal Access Token (PAT)</div>
                   <input type="password" value={gs.token||""} onChange={e=>setGs(p=>({...p,token:e.target.value}))} placeholder="ghp_xxxxxxxxxxxx"
                     style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
-                  <div style={{fontSize:10,color:T.caramel,marginTop:4}}>* สร้างได้จาก GitHub Settings > Developer settings > Tokens (classic)</div>
+                  <div style={{fontSize:10,color:T.caramel,marginTop:4}}>{'* สร้างได้จาก GitHub Settings > Developer settings > Tokens (classic)'}</div>
                 </div>
 
                 <div style={{display:"flex",gap:10}}>
@@ -1937,7 +1937,7 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
             {lastOrderMsg&&<span style={{fontSize:11,color:T.mint,fontWeight:600}}>{lastOrderMsg}</span>}
             <div style={{display:"flex",alignItems:"center",gap:12}}>
               <span style={{fontSize:18,fontWeight:700,color:T.caramelLight}}>฿{fmt(grandTotal)}</span>
-              <span style={{background:T.caramel,padding:"7px 16px",borderRadius:20,fontSize:13,fontWeight:700}}>ดูรายการ ›</span>
+              <span style={{background:T.caramel,padding:"7px 16px",borderRadius:20,fontSize:13,fontWeight:700}}>{'ดูรายการ \u203A'}</span>
             </div>
           </div>
         )}
