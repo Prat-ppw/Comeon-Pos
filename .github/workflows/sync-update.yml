@@ -3,7 +3,7 @@ name: Sync & Update Android Project
 on:
   push:                   # ทำงานทันทีที่มีการ Push ไฟล์ใหม่ขึ้น GitHub
   pull_request:           # ทำงานเมื่อมีการเปิดหรืออัปเดต Pull Request
-  workflow_dispatch:      # ยังคงปุ่มกด Sync manually ไว้ใน GitHub UI
+  workflow_dispatch:      # ปุ่มกด Sync manually จาก GitHub UI
 
 jobs:
   sync-android:
@@ -11,11 +11,11 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # ── 1. Checkout code ───────────────────────────────────────
+      # ── 1. Checkout code (ใช้อัปเดต v4 ล่าสุด) ─────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Setup Node.js ───────────────────────────────────────
+      # ── 2. Setup Node.js (กำหนด Node.js 22 LTS ให้ระบบหลัก) ────
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
