@@ -73,7 +73,7 @@ const MENU_ITEMS = [
 // ─────────────────────────────────────────────────────────────
 // Collision-resistant id generator — no shared mutable counter, so it
 // stays correct across hot-reload and never needs a module-level `let`.
-const genId = (prefix)=> `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+const genId = (prefix)=> prefix + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2,8);
 const fmt = n => round2(n).toLocaleString("th-TH",{minimumFractionDigits:2,maximumFractionDigits:2});
 const fmtInt = n => n.toLocaleString("th-TH",{minimumFractionDigits:0,maximumFractionDigits:0});
 // All money math is rounded to satang (2 decimals) at each step so the
@@ -89,7 +89,7 @@ function round2(n){ return Math.round((n + Number.EPSILON) * 100) / 100; }
 const LS_PREFIX = "brewpos_v2_";
 // Shared across all devices: menu catalog + sales stats only
 // Settings (printer, tax, display) stay per-device (each terminal has own printer)
-const SHARED_KEYS = new Set(["menuItems","categories","catInfo","modGroups","orders"]);
+const SHARED_KEYS = new Set(["menuItems","categories","catInfo","modGroups","orders","githubSettings"]);
 
 // window.storage async wrapper (shared=true broadcasts to all sessions)
 const sharedStore = {
@@ -194,7 +194,52 @@ function getModDetails(selections, mgMap=MODIFIER_GROUPS){
 // Returns { items, dragHandleProps, ghostStyle, draggingId }.
 // Usage: const { items, dragHandleProps } = useDragSort(list, setList, getId)
 // ─────────────────────────────────────────────────────────────
-function useDragSort(items, setItems){ return { items, dragHandleProps:()=>({}) }; }
+function useDragSort(items, setItems){
+  const [draggingId, setDraggingId] = useState(null);
+  const containerRef = useRef(null);
+
+  const dragHandleProps = (id) => ({
+    onPointerDown: (e) => {
+      e.target.setPointerCapture(e.pointerId);
+      setDraggingId(id);
+    },
+    onPointerUp: (e) => {
+      e.target.releasePointerCapture(e.pointerId);
+      setDraggingId(null);
+    },
+    onPointerMove: (e) => {
+      if (draggingId !== id) return;
+      const container = containerRef.current;
+      if (!container) return;
+
+      const rect = container.getBoundingClientRect();
+      const elements = Array.from(container.children);
+      const mouseX = e.clientX;
+      const mouseY = e.clientY;
+
+      const target = elements.find(el => {
+        const r = el.getBoundingClientRect();
+        return mouseX >= r.left && mouseX <= r.right && mouseY >= r.top && mouseY <= r.bottom;
+      });
+
+      if (target) {
+        const targetId = target.getAttribute('data-id');
+        if (targetId && targetId !== String(draggingId)) {
+          const fromIdx = items.findIndex(item => String(item.id) === String(draggingId));
+          const toIdx = items.findIndex(item => String(item.id) === String(targetId));
+          if (fromIdx !== -1 && toIdx !== -1) {
+            const newList = [...items];
+            const [moved] = newList.splice(fromIdx, 1);
+            newList.splice(toIdx, 0, moved);
+            setItems(newList);
+          }
+        }
+      }
+    }
+  });
+
+  return { items, dragHandleProps, draggingId, containerRef };
+}
 
 const AppCtx = createContext(null);
 function useApp(){ return useContext(AppCtx)||{}; }
@@ -305,24 +350,119 @@ function buildThaiQRPayload(account, amount, type="phone"){
   return payload+(crc&0xFFFF).toString(16).toUpperCase().padStart(4,"0");
 }
 // keep old name as alias
-const buildPromptPayPayload = (acc,amt)=>buildThaiQRPayload(acc,amt,"phone");
+function qrPayloadToDataURI(payload, size=8){
+  // Using qrserver as a fallback for the DataURI if offline engine is not fully wired
+  return "https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=" + encodeURIComponent(payload);
+}
 
 function QRCode({ payload, size=220 }){
-  const url = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(payload)}&format=png&margin=2`;
-  return <img src={url} width={size} height={size} alt="QR" style={{borderRadius:12,border:`3px solid ${T.border}`,background:T.white}} onError={e=>{e.target.style.display="none";}}/>;
+  const url = "https://api.qrserver.com/v1/create-qr-code/?size=" + size + "x" + size + "&data=" + encodeURIComponent(payload) + "&format=png&margin=2";
+  return <img src={url} width={size} height={size} alt="QR" style={{borderRadius:12,border:('3px solid ' + T.border),background:T.white}} onError={e=>{e.target.style.display="none";}}/>;
 }
 
 // ─────────────────────────────────────────────────────────────
-// THERMAL PRINTER UTILS
+// THERMAL PRINTER UTILS (ESC/POS Generator)
 // ─────────────────────────────────────────────────────────────
-// Converts an uploaded image (data URL) into a 1-bit monochrome raster
-// suitable for ESC/POS image printing (GS v 0). Thermal printers can't
-// print grayscale/color, so this resizes to the printer's dot width and
-// thresholds each pixel to pure black/white. The result is plain
-// numbers (not a Uint8Array) so it can be safely stored in React state
-// and JSON.stringify'd into localStorage.
+function buildReceiptESCPOS(cart, subtotal, scAmt, vat, total, method, store, tax, mgMap){
+  const esc = [0x1B, 0x40]; // Initialize
+  const add = (s) => {
+    const iconv = new TextEncoder();
+    esc.push(...iconv.encode(s + "\n"));
+  };
 
-function buildReceiptESCPOS(){ return new Uint8Array([]); }
+  esc.push(0x1B, 0x61, 0x01); // Center
+  add(store.storeName);
+  add("--------------------------------");
+  esc.push(0x1B, 0x61, 0x00); // Left
+  cart.forEach(it => {
+    add(it.name + " x" + it.qty);
+    add("                " + (it.unitPrice * it.qty).toFixed(2));
+  });
+  add("--------------------------------");
+  add("Subtotal:       " + subtotal.toFixed(2));
+  add("Total:          " + total.toFixed(2));
+  add("Payment: " + method);
+  esc.push(0x1D, 0x56, 0x41, 0x03); // Cut paper
+  return new Uint8Array(esc);
+}
+
+// Converts an uploaded image (data URL) into a 1-bit monochrome raster
+// suitable for ESC/POS image printing (GS v 0).
+async function imageToESCPOSRaster(dataUrl, width=384){
+  return new Promise(res=>{
+    const img=new Image();
+    img.onload=()=>{
+      const canvas=document.createElement("canvas");
+      const height=Math.round((img.height/img.width)*width);
+      canvas.width=width; canvas.height=height;
+      const ctx=canvas.getContext("2d");
+      ctx.drawImage(img,0,0,width,height);
+      const idata=ctx.getImageData(0,0,width,height);
+      const p=idata.data;
+      const raster=[];
+      for(let y=0; y<height; y++){
+        for(let x=0; x<width; x+=8){
+          let byte=0;
+          for(let b=0; b<8; b++){
+            const i=((y*width)+(x+b))*4;
+            const avg=(p[i]+p[i+1]+p[i+2])/3;
+            if(avg<128) byte|=(0x80>>b);
+          }
+          raster.push(byte);
+        }
+      }
+      res({width, height, data:raster});
+    };
+    img.src=dataUrl;
+  });
+}
+
+async function dispatchPrint(data, settings, setMsg){
+  if(!settings || !settings.enabled) return false;
+  if(settings.type==="usb") return await printUSB(data, setMsg);
+  if(settings.type==="bluetooth") return await printBluetooth(data, setMsg);
+  if(settings.type==="serial") return await printSerial(data, setMsg);
+  return false;
+}
+
+function KitchenTicketPreview({ cart, label, mgMap, store, kitchenStyle }){
+  return(
+    <div style={{background:T.white, width:300, padding:20, boxShadow:"0 4px 12px rgba(0,0,0,0.1)", fontSize:12, fontFamily:"monospace"}}>
+      <div style={{textAlign:"center", fontWeight:700, marginBottom:10}}>{kitchenStyle.kitchenTitle || "ใบสั่งครัว"}</div>
+      <div style={{textAlign:"center", marginBottom:10}}>{store.name}</div>
+      <div style={{borderTop:"1px solid " + T.border, margin:"10px 0"}}/>
+      <div style={{fontWeight:700, marginBottom:10}}>โต๊ะ: {label}</div>
+      {cart.map((it, i)=>(
+        <div key={i} style={{marginBottom:kitchenStyle.itemSpacing?10:2}}>
+          <div style={{display:"flex", justifyContent:"space-between"}}>
+            <span>{it.name}</span>
+            <span>x{it.qty}</span>
+          </div>
+          {selLabel(it.selections, mgMap) && <div style={{fontSize:10, color:T.inkMid}}>{selLabel(it.selections, mgMap)}</div>}
+          {it.note && <div style={{fontSize:10, color:T.red}}>* {it.note}</div>}
+        </div>
+      ))}
+      <div style={{borderTop:"1px solid " + T.border, margin:"10px 0"}}/>
+      <div style={{textAlign:"center", fontSize:10}}>{kitchenStyle.kitchenFooter}</div>
+    </div>
+  );
+}
+
+function DraggableOptionList({ options, onReorder, onUpdate, onRemove }){
+  return(
+    <div style={{display:"flex", flexDirection:"column", gap:6, marginBottom:10}}>
+      {options.map((opt, idx)=>(
+        <div key={opt.id} style={{display:"flex", gap:6, alignItems:"center"}}>
+          <input value={opt.label} onChange={e=>onUpdate(opt.id, {label:e.target.value})}
+            style={{flex:1, padding:"6px 9px", borderRadius:7, border:"1px solid " + T.border, fontSize:12}}/>
+          <input type="number" value={opt.price} onChange={e=>onUpdate(opt.id, {price:parseFloat(e.target.value)||0})}
+            style={{width:50, padding:"6px 4px", borderRadius:7, border:"1px solid " + T.border, fontSize:12, textAlign:"right"}}/>
+          <button onClick={()=>onRemove(opt.id)} style={{border:"none", background:"none", color:T.red, cursor:"pointer", padding:4}}>✕</button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 async function printUSB(data, setMsg){
   try{
@@ -372,13 +512,14 @@ async function printBluetooth(data, setMsg){
 async function printSerial(data, setMsg){
   try{
     if(!navigator.serial){ setMsg("เบราว์เซอร์ไม่รองรับ Serial (ใช้ Chrome/Edge)"); return false; }
+    // Sunmi D2s Plus มักใช้ BaudRate 115200 สำหรับเครื่องพิมพ์ภายใน
     const port = await navigator.serial.requestPort();
-    await port.open({baudRate:9600});
+    await port.open({baudRate:115200});
     const writer = port.writable.getWriter();
     await writer.write(data);
     writer.releaseLock();
     await port.close();
-    setMsg("✅ พิมพ์สำเร็จ (Serial)"); return true;
+    setMsg("✅ พิมพ์สำเร็จ (Sunmi Serial)"); return true;
   }catch(e){ setMsg("❌ Serial: "+e.message); return false; }
 }
 
@@ -428,7 +569,7 @@ function ModifierModal({ item, onConfirm, onCancel }){
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(30,10,0,0.6)",zIndex:900,display:"flex",alignItems:"center",justifyContent:"center",padding:12}}>
       <div style={{background:T.white,borderRadius:18,width:"100%",maxWidth:460,maxHeight:"90vh",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
-        <div style={{padding:"16px 18px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",gap:10}}>
+        <div style={{padding:"16px 18px",borderBottom:('1px solid ' + T.border),display:"flex",alignItems:"center",gap:10}}>
           <ItemThumb item={item} size={52} radius={10}/>
           <div style={{flex:1}}><div style={{fontWeight:700,fontSize:15,color:T.ink}}>{item.name}</div><div style={{fontSize:12,color:T.inkMid}}>฿{item.price} เริ่มต้น</div></div>
           <button onClick={onCancel} style={{width:28,height:28,borderRadius:"50%",border:"none",background:T.border,cursor:"pointer",fontSize:15,color:T.inkMid}}>✕</button>
@@ -442,7 +583,7 @@ function ModifierModal({ item, onConfirm, onCancel }){
                 <div style={{fontSize:13,fontWeight:700,color:T.ink,marginBottom:7,display:"flex",alignItems:"center",gap:6}}>
                   {g.label}
                   {g.required && <span style={{fontSize:10,background:T.caramel,color:T.white,padding:"1px 6px",borderRadius:10,fontWeight:700}}>จำเป็น</span>}
-                  {isMulti(g) && <span style={{fontSize:10,background:"#E0F0E8",color:T.mint,padding:"1px 6px",borderRadius:10,fontWeight:700}}>{maxSel(g)>=99?"หลายอย่าง":`เลือกได้ ${maxSel(g)}`}</span>}
+                  {isMulti(g) && <span style={{fontSize:10,background:"#E0F0E8",color:T.mint,padding:"1px 6px",borderRadius:10,fontWeight:700}}>{maxSel(g)>=99?"หลายอย่าง":("เลือกได้ " + maxSel(g))}</span>}
                 </div>
                 <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
                   {g.options.map(opt=>{
@@ -450,9 +591,9 @@ function ModifierModal({ item, onConfirm, onCancel }){
                     const atCap=isMulti(g)&&maxSel(g)<99&&(cur||[]).length>=maxSel(g)&&!selected;
                     return(
                       <button key={opt.id} onClick={()=>{ if(!atCap||selected) toggle(gid,opt.id); }}
-                        style={{padding:"6px 12px",borderRadius:20,border:selected?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:selected?"#FFF5EA":atCap?"#F5F5F5":T.white,color:selected?T.caramel:atCap?T.inkLight:T.inkMid,fontWeight:selected?700:500,fontSize:13,cursor:atCap?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:5,transition:"all 0.1s",opacity:atCap?0.5:1}}>
-                        {isMulti(g) && <span style={{width:13,height:13,borderRadius:3,border:selected?`2px solid ${T.caramel}`:`1.5px solid ${T.inkLight}`,background:selected?T.caramel:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:9,color:T.white,flexShrink:0}}>{selected?"✓":""}</span>}
-                        {!isMulti(g) && <span style={{width:11,height:11,borderRadius:"50%",border:selected?`2px solid ${T.caramel}`:`1.5px solid ${T.inkLight}`,background:selected?T.caramel:"transparent",display:"inline-block",flexShrink:0}}/>}
+                        style={{padding:"6px 12px",borderRadius:20,border:selected?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:selected?"#FFF5EA":atCap?"#F5F5F5":T.white,color:selected?T.caramel:atCap?T.inkLight:T.inkMid,fontWeight:selected?700:500,fontSize:13,cursor:atCap?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:5,transition:"all 0.1s",opacity:atCap?0.5:1}}>
+                        {isMulti(g) && <span style={{width:13,height:13,borderRadius:3,border:selected?('2px solid ' + T.caramel):('1.5px solid ' + T.inkLight),background:selected?T.caramel:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:9,color:T.white,flexShrink:0}}>{selected?"✓":""}</span>}
+                        {!isMulti(g) && <span style={{width:11,height:11,borderRadius:"50%",border:selected?('2px solid ' + T.caramel):('1.5px solid ' + T.inkLight),background:selected?T.caramel:"transparent",display:"inline-block",flexShrink:0}}/>}
                         {opt.label}{opt.price>0&&<span style={{fontSize:11,color:T.inkMid}}>+฿{opt.price}</span>}
                       </button>
                     );
@@ -467,13 +608,13 @@ function ModifierModal({ item, onConfirm, onCancel }){
             );
           })}
           <div><div style={{fontSize:13,fontWeight:700,color:T.ink,marginBottom:6}}>หมายเหตุ</div>
-            <input value={note} onChange={e=>setNote(e.target.value)} placeholder="เช่น ไม่ใส่น้ำตาล..." style={{width:"100%",padding:"8px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+            <input value={note} onChange={e=>setNote(e.target.value)} placeholder="เช่น ไม่ใส่น้ำตาล..." style={{width:"100%",padding:"8px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
           </div>
         </div>
-        <div style={{padding:"13px 18px",borderTop:`1px solid ${T.border}`}}>
+        <div style={{padding:"13px 18px",borderTop:('1px solid ' + T.border)}}>
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
             <span style={{fontSize:13,color:T.inkMid}}>จำนวน</span>
-            <button onClick={()=>setQty(q=>Math.max(1,q-1))} style={{width:28,height:28,borderRadius:7,border:`1.5px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:16,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",color:T.ink}}>−</button>
+            <button onClick={()=>setQty(q=>Math.max(1,q-1))} style={{width:28,height:28,borderRadius:7,border:('1.5px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:16,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",color:T.ink}}>−</button>
             <span style={{fontSize:15,fontWeight:700,color:T.ink,minWidth:20,textAlign:"center"}}>{qty}</span>
             <button onClick={()=>setQty(q=>q+1)} style={{width:28,height:28,borderRadius:7,border:"none",background:T.caramel,cursor:"pointer",fontSize:16,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",color:T.white}}>+</button>
             <div style={{flex:1,textAlign:"right",fontSize:17,fontWeight:700,color:T.caramel}}>฿{fmt(unitPrice*qty)}</div>
@@ -566,7 +707,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
     <div style={{position:"fixed",inset:0,background:"rgba(30,10,0,0.65)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:12}}>
       <div style={{background:T.white,borderRadius:20,width:"100%",maxWidth:500,maxHeight:"95vh",display:"flex",flexDirection:"column",boxShadow:"0 24px 72px rgba(0,0,0,0.35)"}}>
         {/* Header */}
-        <div style={{padding:"16px 20px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{padding:"16px 20px",borderBottom:('1px solid ' + T.border),display:"flex",alignItems:"center",justifyContent:"space-between"}}>
           <span style={{fontWeight:700,fontSize:16,color:T.ink}}>
             {step==="choose"?"ชำระเงิน":step==="cash"?"ชำระด้วยเงินสด":"QR Code K-Bank"}
           </span>
@@ -586,7 +727,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
                 <span style={{fontSize:13,fontWeight:600,color:T.ink}}>฿{fmt(it.unitPrice*it.qty)}</span>
               </div>
             ))}
-            <div style={{borderTop:`1px dashed ${T.border}`,marginTop:8,paddingTop:8}}>
+            <div style={{borderTop:('1px dashed ' + T.border),marginTop:8,paddingTop:8}}>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
                 <span style={{fontSize:13,color:T.inkMid}}>ยอดที่สั่ง</span>
                 <span style={{fontSize:13,color:T.ink}}>฿{fmt(subtotal)}</span>
@@ -616,10 +757,10 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
               <button onClick={()=>setStep("cash")} style={{padding:"16px",borderRadius:12,border:"none",cursor:"pointer",background:T.coffee,color:T.white,fontSize:15,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
                 <span style={{fontSize:22}}>💵</span> ชำระเงินสด
               </button>
-              <button onClick={()=>setStep("qr")} style={{padding:"16px",borderRadius:12,border:`2px solid ${T.caramel}`,cursor:"pointer",background:"#FFF8EE",color:T.caramel,fontSize:15,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+              <button onClick={()=>setStep("qr")} style={{padding:"16px",borderRadius:12,border:('2px solid ' + T.caramel),cursor:"pointer",background:"#FFF8EE",color:T.caramel,fontSize:15,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
                 <span style={{fontSize:22}}>📱</span> QR / โอนพร้อมเพย์
               </button>
-              <button onClick={()=>{ pushCustomer({}); complete("บัตรเครดิต"); }} style={{padding:"16px",borderRadius:12,border:`2px solid ${T.border}`,cursor:"pointer",background:T.white,color:T.inkMid,fontSize:15,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+              <button onClick={()=>{ pushCustomer({}); complete("บัตรเครดิต"); }} style={{padding:"16px",borderRadius:12,border:('2px solid ' + T.border),cursor:"pointer",background:T.white,color:T.inkMid,fontSize:15,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
                 <span style={{fontSize:22}}>💳</span> บัตรเครดิต / เดบิต
               </button>
             </div>
@@ -631,9 +772,9 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
               <div style={{fontSize:13,fontWeight:700,color:T.ink,marginBottom:8}}>เงินที่ลูกค้าจ่าย</div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:7,marginBottom:10}}>
                 {quickAmounts.map(v=>(
-                  <button key={v} onClick={()=>setCash(String(v))} style={{padding:"10px",borderRadius:9,border:cash===String(v)?`2px solid ${T.caramel}`:`1px solid ${T.border}`,background:cash===String(v)?"#FFF8EE":T.cream,cursor:"pointer",fontSize:14,fontWeight:600,color:cash===String(v)?T.caramel:T.ink}}>฿{fmtInt(v)}</button>
+                  <button key={v} onClick={()=>setCash(String(v))} style={{padding:"10px",borderRadius:9,border:cash===String(v)?('2px solid ' + T.caramel):('1px solid ' + T.border),background:cash===String(v)?"#FFF8EE":T.cream,cursor:"pointer",fontSize:14,fontWeight:600,color:cash===String(v)?T.caramel:T.ink}}>฿{fmtInt(v)}</button>
                 ))}
-                <input value={cash} onChange={e=>setCash(e.target.value)} placeholder="จำนวนอื่น" style={{padding:"10px",borderRadius:9,border:`1px solid ${T.border}`,fontSize:13,textAlign:"center",gridColumn:"span 2"}}/>
+                <input value={cash} onChange={e=>setCash(e.target.value)} placeholder="จำนวนอื่น" style={{padding:"10px",borderRadius:9,border:('1px solid ' + T.border),fontSize:13,textAlign:"center",gridColumn:"span 2"}}/>
               </div>
               {/* Summary box */}
               <div style={{background:T.cream,borderRadius:12,padding:"12px 14px",marginBottom:12}}>
@@ -661,7 +802,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
                   <span style={{fontSize:13,color:T.inkMid}}>เงินที่ลูกค้าจ่าย</span>
                   <span style={{fontSize:14,fontWeight:700,color:received>=total?T.mint:T.red}}>฿{received>0?fmt(received):"-"}</span>
                 </div>
-                <div style={{borderTop:`1px solid ${T.border}`,paddingTop:8,display:"flex",justifyContent:"space-between"}}>
+                <div style={{borderTop:('1px solid ' + T.border),paddingTop:8,display:"flex",justifyContent:"space-between"}}>
                   <span style={{fontSize:15,fontWeight:700,color:T.ink}}>เงินทอน</span>
                   <span style={{fontSize:18,fontWeight:700,color:change>=0&&received>0?T.mint:T.red}}>
                     {received>0?(change>=0?"฿"+fmt(change):"ขาด ฿"+fmt(-change)):"-"}
@@ -669,7 +810,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
                 </div>
               </div>
               <div style={{display:"flex",gap:8}}>
-                <button onClick={()=>setStep("choose")} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>← กลับ</button>
+                <button onClick={()=>setStep("choose")} style={{flex:1,padding:"11px",borderRadius:10,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>← กลับ</button>
                 <button disabled={change<0||received===0} onClick={async()=>{ pushCustomer({paid:received,change,showQR:false}); await doPrint("เงินสด"); complete("เงินสด"); }}
                   style={{flex:2,padding:"11px",borderRadius:10,border:"none",background:change>=0&&received>0?T.mint:T.border,cursor:change>=0&&received>0?"pointer":"not-allowed",color:T.white,fontSize:14,fontWeight:700}}>
                   ✅ ยืนยันรับเงิน
@@ -688,7 +829,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
                   </div>
                   {/* QR with amount badge */}
                   <div style={{position:"relative"}}>
-                    <div style={{background:T.white,borderRadius:16,padding:14,border:`2px solid ${T.caramel}`,boxShadow:"0 4px 24px rgba(200,129,58,0.2)"}}>
+                    <div style={{background:T.white,borderRadius:16,padding:14,border:('2px solid ' + T.caramel),boxShadow:"0 4px 24px rgba(200,129,58,0.2)"}}>
                       <img src={qrUrl} alt="Thai QR" width={240} height={240} style={{display:"block",borderRadius:8}}/>
                     </div>
                     <div style={{position:"absolute",bottom:-16,left:"50%",transform:"translateX(-50%)",background:T.caramel,color:T.white,borderRadius:20,padding:"6px 24px",fontWeight:700,fontSize:17,whiteSpace:"nowrap",boxShadow:"0 2px 10px rgba(200,129,58,0.45)"}}>
@@ -712,7 +853,7 @@ function PaymentModal({ cart, subtotal, onClose, onComplete, printerSettings, cu
               )}
               {printMsg && <div style={{fontSize:12,color:T.inkMid,textAlign:"center"}}>{printMsg}</div>}
               <div style={{display:"flex",gap:8,width:"100%"}}>
-                <button onClick={()=>setStep("choose")} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>← กลับ</button>
+                <button onClick={()=>setStep("choose")} style={{flex:1,padding:"11px",borderRadius:10,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>← กลับ</button>
                 <button onClick={async()=>{ pushCustomer({paid:total,change:0,showQR:false}); await doPrint("QR โอนเงิน"); complete("QR / โอน"); }}
                   style={{flex:2,padding:"11px",borderRadius:10,border:"none",background:T.mint,color:T.white,fontSize:14,fontWeight:700,cursor:"pointer"}}>
                   ✅ ยืนยันรับชำระแล้ว
@@ -755,7 +896,7 @@ function ConfirmDialog({ title, message, confirmLabel="ยืนยัน", canc
         {title&&<div style={{fontSize:16,fontWeight:700,color:T.ink,marginBottom:8}}>{title}</div>}
         <div style={{fontSize:13,color:T.inkMid,lineHeight:1.6,marginBottom:20,whiteSpace:"pre-line"}}>{message}</div>
         <div style={{display:"flex",gap:8}}>
-          {onCancel&&<button onClick={onCancel} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600,color:T.ink}}>{cancelLabel}</button>}
+          {onCancel&&<button onClick={onCancel} style={{flex:1,padding:"11px",borderRadius:10,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600,color:T.ink}}>{cancelLabel}</button>}
           <button onClick={onConfirm} style={{flex:onCancel?1.4:1,padding:"11px",borderRadius:10,border:"none",background:danger?T.red:T.coffee,color:T.white,cursor:"pointer",fontSize:13,fontWeight:700}}>{confirmLabel}</button>
         </div>
       </div>
@@ -767,10 +908,10 @@ function PctInput({ value, onChange, min=0, max=100 }){
   return(
     <div style={{display:"flex",alignItems:"center",gap:6}}>
       <button onClick={()=>onChange(Math.max(min, parseFloat(value||0)-1))}
-        style={{width:26,height:26,borderRadius:7,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+        style={{width:26,height:26,borderRadius:7,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
       <input type="number" value={value} min={min} max={max}
         onChange={e=>onChange(Math.min(max,Math.max(min,parseFloat(e.target.value)||0)))}
-        style={{width:54,padding:"5px 0",borderRadius:8,border:`1.5px solid ${T.border}`,fontSize:14,fontWeight:700,textAlign:"center",color:T.ink}}/>
+        style={{width:54,padding:"5px 0",borderRadius:8,border:('1.5px solid ' + T.border),fontSize:14,fontWeight:700,textAlign:"center",color:T.ink}}/>
       <span style={{fontSize:13,color:T.inkMid,fontWeight:600}}>%</span>
       <button onClick={()=>onChange(Math.min(max, parseFloat(value||0)+1))}
         style={{width:26,height:26,borderRadius:7,border:"none",background:T.caramel,cursor:"pointer",fontSize:14,fontWeight:700,color:T.white,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
@@ -778,10 +919,10 @@ function PctInput({ value, onChange, min=0, max=100 }){
   );
 }
 
-function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, onSaveTax, onSaveDisplay, onClose }){
+function PrinterSettingsModal({ settings, taxSettings, displaySettings, githubSettings, onSave, onSaveTax, onSaveDisplay, onSaveGithub, onClose }){
   const { modGroupsMap } = useApp();
   const mgMap = modGroupsMap || MODIFIER_GROUPS;
-  const [tab, setTab] = useState("store"); // "store"|"tax"|"printer"|"preview"|"display"
+  const [tab, setTab] = useState("store"); // "store"|"tax"|"printer"|"preview"|"display"|"github"
   const [s, setS] = useState(settings||{
     enabled:false, type:"usb",
     storeName:"Sweet Nothing", storePhone:"", storeAddress:"", storeTaxId:"",
@@ -790,6 +931,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
     qrType:"phone", qrAccount:"",
   });
   const [tx, setTx] = useState({ ...DEFAULT_TAX, ...(taxSettings||{}) });
+  const [gs, setGs] = useState(githubSettings || { token: "", owner: "Prat-ppw", repo: "Comeon-Pos", autoSync: true });
   const [testMsg, setTestMsg] = useState("");
   const [uploadingHeaderLogo, setUploadingHeaderLogo] = useState(false);
   const [uploadingFooterImage, setUploadingFooterImage] = useState(false);
@@ -897,18 +1039,18 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
     <div style={{position:"fixed",inset:0,background:"rgba(30,10,0,0.65)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:12}}>
       <div style={{background:T.white,borderRadius:20,width:"100%",maxWidth:tab==="display"?600:480,maxHeight:"92vh",display:"flex",flexDirection:"column",boxShadow:"0 24px 72px rgba(0,0,0,0.3)",transition:"max-width 0.25s"}}>
         {/* Header */}
-        <div style={{padding:"14px 20px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{padding:"14px 20px",borderBottom:('1px solid ' + T.border),display:"flex",alignItems:"center",justifyContent:"space-between"}}>
           <span style={{fontWeight:700,fontSize:15,color:T.ink}}>⚙️ ตั้งค่า</span>
           <button onClick={onClose} style={{width:28,height:28,borderRadius:"50%",border:"none",background:T.border,cursor:"pointer",fontSize:15}}>✕</button>
         </div>
 
         {/* Tabs */}
-        <div style={{display:"flex",borderBottom:`1px solid ${T.border}`,background:T.cream,overflowX:"auto",flexShrink:0}}>
-          {[{id:"store",icon:"🏪",label:"ร้านค้า"},{id:"tax",icon:"💰",label:"VAT & SC"},{id:"printer",icon:"🖨️",label:"เครื่องพิมพ์"},{id:"display",icon:"🖥️",label:"จอลูกค้า"}].map(t=>(
+        <div style={{display:"flex",borderBottom:('1px solid ' + T.border),background:T.cream,overflowX:"auto",flexShrink:0}}>
+          {[{id:"store",icon:"🏪",label:"ร้านค้า"},{id:"tax",icon:"💰",label:"VAT & SC"},{id:"printer",icon:"🖨️",label:"เครื่องพิมพ์"},{id:"display",icon:"🖥️",label:"จอลูกค้า"},{id:"github",icon:"☁️",label:"ซิงค์ข้อมูล"}].map(t=>(
             <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:"0 0 auto",padding:"11px 14px",border:"none",cursor:"pointer",fontWeight:700,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",gap:5,
               background:tab===t.id?T.white:"transparent",
               color:tab===t.id?T.caramel:T.inkMid,
-              borderBottom:tab===t.id?`2px solid ${T.caramel}`:"2px solid transparent",
+              borderBottom:tab===t.id?('2px solid ' + T.caramel):"2px solid transparent",
               transition:"all 0.15s",whiteSpace:"nowrap"}}>
               <span>{t.icon}</span>{t.label}
             </button>
@@ -925,7 +1067,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
               {/* Header logo upload */}
               <div style={{display:"flex",gap:14,alignItems:"flex-start"}}>
                 <input ref={headerLogoRef} type="file" accept="image/*" onChange={handleHeaderLogoFile} style={{display:"none"}}/>
-                <div onClick={()=>headerLogoRef.current.click()} style={{width:90,height:90,borderRadius:14,border:`2.5px dashed ${T.caramel}`,background:"#FFF8EE",cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4}}>
+                <div onClick={()=>headerLogoRef.current.click()} style={{width:90,height:90,borderRadius:14,border:('2.5px dashed ' + T.caramel),background:"#FFF8EE",cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4}}>
                   {s.headerLogo ? (
                     <img src={s.headerLogo} alt="" style={{width:"100%",height:"100%",objectFit:"contain",background:T.white}}/>
                   ) : uploadingHeaderLogo ? (
@@ -953,18 +1095,18 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                   <div key={f.key}>
                     <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>{f.label}</div>
                     <input value={s[f.key]||""} onChange={e=>setS(p=>({...p,[f.key]:e.target.value}))} placeholder={f.placeholder}
-                      style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+                      style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
                   </div>
                 ))}
                 <div>
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ที่อยู่ร้าน</div>
                   <textarea value={s.storeAddress||""} onChange={e=>setS(p=>({...p,storeAddress:e.target.value}))} placeholder="123 ถ.สุขุมวิท แขวง... เขต... กรุงเทพฯ 10110" rows={2}
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box",fontFamily:"inherit",resize:"vertical"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box",fontFamily:"inherit",resize:"vertical"}}/>
                 </div>
                 <div>
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ข้อความใต้ชื่อร้าน (หัวใบเสร็จ)</div>
                   <input value={s.receiptHeaderText||""} onChange={e=>setS(p=>({...p,receiptHeaderText:e.target.value}))} placeholder="เช่น สาขาสยาม"
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
                 </div>
               </div>
 
@@ -974,11 +1116,11 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                 <div>
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ข้อความท้ายใบเสร็จ (ใส่ได้หลายบรรทัด)</div>
                   <textarea value={s.receiptFooterText||""} onChange={e=>setS(p=>({...p,receiptFooterText:e.target.value}))} placeholder={"ขอบคุณที่ใช้บริการ :)\nFacebook/Line: @sweetnothing"} rows={3}
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box",fontFamily:"inherit",resize:"vertical"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box",fontFamily:"inherit",resize:"vertical"}}/>
                 </div>
                 <div style={{display:"flex",gap:14,alignItems:"flex-start"}}>
                   <input ref={footerImageRef} type="file" accept="image/*" onChange={handleFooterImageFile} style={{display:"none"}}/>
-                  <div onClick={()=>footerImageRef.current.click()} style={{width:74,height:74,borderRadius:12,border:`2.5px dashed ${T.caramel}`,background:T.white,cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3}}>
+                  <div onClick={()=>footerImageRef.current.click()} style={{width:74,height:74,borderRadius:12,border:('2.5px dashed ' + T.caramel),background:T.white,cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3}}>
                     {s.footerImage ? (
                       <img src={s.footerImage} alt="" style={{width:"100%",height:"100%",objectFit:"contain",background:T.white}}/>
                     ) : uploadingFooterImage ? (
@@ -1017,7 +1159,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     {/* Inclusive / Exclusive toggle */}
                     <div style={{display:"flex",gap:8}}>
                       {[{v:false,label:"คิดเพิ่มจากราคา",sub:"ราคา + VAT"},{v:true,label:"รวมอยู่ในราคาแล้ว",sub:"แยกแสดงในใบเสร็จ"}].map(opt=>(
-                        <button key={String(opt.v)} onClick={()=>setTx(p=>({...p,vatInclusive:opt.v}))} style={{flex:1,padding:"9px 10px",borderRadius:10,border:tx.vatInclusive===opt.v?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:tx.vatInclusive===opt.v?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left"}}>
+                        <button key={String(opt.v)} onClick={()=>setTx(p=>({...p,vatInclusive:opt.v}))} style={{flex:1,padding:"9px 10px",borderRadius:10,border:tx.vatInclusive===opt.v?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:tx.vatInclusive===opt.v?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left"}}>
                           <div style={{fontSize:12,fontWeight:700,color:tx.vatInclusive===opt.v?T.caramel:T.ink}}>{opt.label}</div>
                           <div style={{fontSize:10,color:T.inkLight,marginTop:2}}>{opt.sub}</div>
                         </button>
@@ -1045,7 +1187,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
               </div>
 
               {/* Live preview */}
-              <div style={{background:"#FFF8EE",borderRadius:14,padding:"14px 16px",border:`1.5px solid ${T.caramelLight}`}}>
+              <div style={{background:"#FFF8EE",borderRadius:14,padding:"14px 16px",border:('1.5px solid ' + T.caramelLight)}}>
                 <div style={{fontSize:13,fontWeight:700,color:T.caramel,marginBottom:10}}>🧾 ตัวอย่างคำนวณ (ยอดอาหาร ฿100)</div>
                 <div style={{display:"flex",flexDirection:"column",gap:5}}>
                   <div style={{display:"flex",justifyContent:"space-between",fontSize:13}}>
@@ -1064,7 +1206,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                       <span style={{color:T.inkMid}}>{tx.vatInclusive?"(บวกอยู่)":"+ "}฿{fmt(preview.vatAmt)}</span>
                     </div>
                   )}
-                  <div style={{borderTop:`1.5px solid ${T.caramelLight}`,paddingTop:8,display:"flex",justifyContent:"space-between",fontSize:15,fontWeight:700}}>
+                  <div style={{borderTop:('1.5px solid ' + T.caramelLight),paddingTop:8,display:"flex",justifyContent:"space-between",fontSize:15,fontWeight:700}}>
                     <span style={{color:T.ink}}>รวมสุทธิ</span>
                     <span style={{color:T.caramel}}>฿{fmt(preview.grandTotal)}</span>
                   </div>
@@ -1091,7 +1233,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     {id:"bluetooth",icon:"📶",label:"Bluetooth (BLE)",desc:"เชื่อมต่อไร้สาย — Thermal printer BLE"},
                     {id:"serial",icon:"🔗",label:"Serial / RS232",desc:"พอร์ต COM / RS232 (ต้องใช้ Chrome 89+)"},
                   ].map(opt=>(
-                    <button key={opt.id} onClick={()=>setS(p=>({...p,type:opt.id}))} style={{padding:"11px 14px",borderRadius:10,border:s.type===opt.id?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:s.type===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
+                    <button key={opt.id} onClick={()=>setS(p=>({...p,type:opt.id}))} style={{padding:"11px 14px",borderRadius:10,border:s.type===opt.id?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:s.type===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
                       <span style={{fontSize:20}}>{opt.icon}</span>
                       <div>
                         <div style={{fontWeight:600,fontSize:13,color:s.type===opt.id?T.caramel:T.ink}}>{opt.label}</div>
@@ -1105,7 +1247,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
 
               {/* Zadig warning for receipt printer USB */}
               {s.type==="usb" && (
-                <div style={{background:"#FFF8E6",borderRadius:10,padding:"11px 13px",border:`1px solid ${T.caramelLight}`}}>
+                <div style={{background:"#FFF8E6",borderRadius:10,padding:"11px 13px",border:('1px solid ' + T.caramelLight)}}>
                   <div style={{fontSize:12,fontWeight:700,color:T.caramel,marginBottom:5}}>⚠️ Windows: ต้องติดตั้ง Zadig ก่อน</div>
                   <div style={{fontSize:11,color:T.inkMid,lineHeight:1.7}}>
                     Mac / Linux / Android: ไม่ต้องทำอะไร — เสียบ USB แล้วกดทดสอบได้เลย<br/>
@@ -1132,7 +1274,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                       {id:"nationalid",icon:"🪪", label:"รหัสบัตรประชาชน 13 หลัก",  sub:"PromptPay ผูกเลขบัตรประชาชน"},
                       {id:"reference", icon:"🏦", label:"เลขอ้างอิง K-Shop / ธนาคาร", sub:"Merchant Reference หรือ Biller ID"},
                     ].map(opt=>(
-                      <button key={opt.id} onClick={()=>setS(p=>({...p,qrType:opt.id}))} style={{padding:"10px 12px",borderRadius:10,border:s.qrType===opt.id?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:s.qrType===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
+                      <button key={opt.id} onClick={()=>setS(p=>({...p,qrType:opt.id}))} style={{padding:"10px 12px",borderRadius:10,border:s.qrType===opt.id?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:s.qrType===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
                         <span style={{fontSize:20,flexShrink:0}}>{opt.icon}</span>
                         <div style={{flex:1}}>
                           <div style={{fontSize:13,fontWeight:s.qrType===opt.id?700:500,color:s.qrType===opt.id?T.caramel:T.ink}}>{opt.label}</div>
@@ -1151,7 +1293,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                   </div>
                   <input value={s.qrAccount||""} onChange={e=>setS(p=>({...p,qrAccount:e.target.value}))}
                     placeholder={s.qrType==="phone"?"0812345678":s.qrType==="nationalid"?"1234567890123":"KPS004KB000002073343"}
-                    style={{width:"100%",padding:"11px 13px",borderRadius:10,border:`2px solid ${T.caramel}`,fontSize:15,fontWeight:700,boxSizing:"border-box",color:T.coffee,letterSpacing:"0.5px"}}/>
+                    style={{width:"100%",padding:"11px 13px",borderRadius:10,border:('2px solid ' + T.caramel),fontSize:15,fontWeight:700,boxSizing:"border-box",color:T.coffee,letterSpacing:"0.5px"}}/>
                 </div>
 
                 {/* Live QR preview — generated locally, never sent anywhere */}
@@ -1161,7 +1303,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     <img
                       src={qrPayloadToDataURI(buildThaiQRPayload(s.qrAccount,1,s.qrType||"phone"), 6)}
                       width={180} height={180} alt="QR Preview"
-                      style={{borderRadius:12,border:`2px solid ${T.caramel}`,background:T.white,padding:4}}/>
+                      style={{borderRadius:12,border:('2px solid ' + T.caramel),background:T.white,padding:4}}/>
                     <div style={{fontSize:11,color:T.inkLight,textAlign:"center"}}>QR จริงจะมียอดตามออเดอร์ที่สั่ง</div>
                   </div>
                 )}
@@ -1176,7 +1318,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
               <div style={{background:T.cream,borderRadius:12,padding:"12px 14px"}}>
                 <div style={{fontSize:13,fontWeight:700,color:T.ink,marginBottom:6}}>ทดสอบการพิมพ์</div>
                 <div style={{fontSize:12,color:T.inkMid,marginBottom:10}}>กดปุ่มเพื่อพิมพ์ใบเสร็จทดสอบ — เบราว์เซอร์จะขอสิทธิ์เข้าถึงอุปกรณ์</div>
-                <button onClick={testPrint} style={{padding:"9px 18px",borderRadius:9,border:`1.5px solid ${T.caramel}`,background:T.white,cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>🖨️ ทดสอบพิมพ์</button>
+                <button onClick={testPrint} style={{padding:"9px 18px",borderRadius:9,border:('1.5px solid ' + T.caramel),background:T.white,cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>🖨️ ทดสอบพิมพ์</button>
                 {testMsg && <div style={{marginTop:8,fontSize:12,color:T.inkMid}}>{testMsg}</div>}
               </div>
 
@@ -1220,7 +1362,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     {id:"bluetooth",icon:"📶",label:"Bluetooth (BLE)",desc:"เชื่อมต่อไร้สาย — Thermal printer BLE"},
                     {id:"serial",icon:"🔗",label:"Serial / RS232",desc:"พอร์ต COM / RS232 (ต้องใช้ Chrome 89+)"},
                   ].map(opt=>(
-                    <button key={opt.id} onClick={()=>setKs(p=>({...p,type:opt.id}))} style={{padding:"11px 14px",borderRadius:10,border:ks.type===opt.id?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:ks.type===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
+                    <button key={opt.id} onClick={()=>setKs(p=>({...p,type:opt.id}))} style={{padding:"11px 14px",borderRadius:10,border:ks.type===opt.id?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:ks.type===opt.id?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10}}>
                       <span style={{fontSize:20}}>{opt.icon}</span>
                       <div>
                         <div style={{fontWeight:600,fontSize:13,color:ks.type===opt.id?T.caramel:T.ink}}>{opt.label}</div>
@@ -1234,7 +1376,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
 
               {/* Windows USB warning */}
               {ks.type==="usb" && (
-                <div style={{background:"#FFF8E6",borderRadius:10,padding:"11px 13px",border:`1px solid ${T.caramelLight}`}}>
+                <div style={{background:"#FFF8E6",borderRadius:10,padding:"11px 13px",border:('1px solid ' + T.caramelLight)}}>
                   <div style={{fontSize:12,fontWeight:700,color:T.caramel,marginBottom:5}}>⚠️ Windows: ต้องติดตั้ง Zadig ก่อน</div>
                   <div style={{fontSize:11,color:T.inkMid,lineHeight:1.7}}>
                     Mac / Linux / Android: ไม่ต้องทำอะไร — เสียบ USB แล้วกดทดสอบได้เลย<br/>
@@ -1256,19 +1398,19 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ชื่อที่แสดงหัวใบ (ถ้ามี)</div>
                   <input value={ks.kitchenName||""} onChange={e=>setKs(p=>({...p,kitchenName:e.target.value}))}
                     placeholder="เช่น Sweet Nothing Bar"
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
                 </div>
                 <div>
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ชื่อหัวใบสั่งครัว</div>
                   <input value={ks.kitchenTitle||""} onChange={e=>setKs(p=>({...p,kitchenTitle:e.target.value}))}
                     placeholder="ใบสั่งครัว"
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
                 </div>
                 <div>
                   <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>ข้อความท้ายใบ</div>
                   <input value={ks.kitchenFooter||""} onChange={e=>setKs(p=>({...p,kitchenFooter:e.target.value}))}
                     placeholder="เช่น รีบเสิร์ฟ! ❤️"
-                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,boxSizing:"border-box"}}/>
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
                 </div>
                 <div style={{display:"flex",gap:10}}>
                   <div style={{flex:1}}>
@@ -1276,7 +1418,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     <div style={{display:"flex",gap:5}}>
                       {["=","-","═","*"].map(ch=>(
                         <button key={ch} onClick={()=>setKs(p=>({...p,dividerChar:ch}))}
-                          style={{flex:1,padding:"7px 4px",borderRadius:8,border:ks.dividerChar===ch?`2px solid ${T.caramel}`:`1px solid ${T.border}`,background:ks.dividerChar===ch?"#FFF8EE":T.white,cursor:"pointer",fontSize:13,color:ks.dividerChar===ch?T.caramel:T.inkMid,fontWeight:700}}>
+                          style={{flex:1,padding:"7px 4px",borderRadius:8,border:ks.dividerChar===ch?('2px solid ' + T.caramel):('1px solid ' + T.border),background:ks.dividerChar===ch?"#FFF8EE":T.white,cursor:"pointer",fontSize:13,color:ks.dividerChar===ch?T.caramel:T.inkMid,fontWeight:700}}>
                           {ch}
                         </button>
                       ))}
@@ -1301,7 +1443,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
                     "โต๊ะ 3", mgMap, ki.store, ki.style
                   );
                   await dispatchPrint(testData, ks, setKitchenTestMsg);
-                }} style={{padding:"9px 18px",borderRadius:9,border:`1.5px solid ${T.caramel}`,background:T.white,cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
+                }} style={{padding:"9px 18px",borderRadius:9,border:('1.5px solid ' + T.caramel),background:T.white,cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
                   🍳 ทดสอบพิมครัว
                 </button>
                 {kitchenTestMsg && <div style={{marginTop:8,fontSize:12,color:T.inkMid}}>{kitchenTestMsg}</div>}
@@ -1327,7 +1469,7 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
           {tab==="display" && (
             <>
               {/* Live preview */}
-              <div style={{borderRadius:14,overflow:"hidden",border:`2px solid ${T.border}`,aspectRatio:"16/10",position:"relative",background:ds.bgColor||"#3B1F0E",display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <div style={{borderRadius:14,overflow:"hidden",border:('2px solid ' + T.border),aspectRatio:"16/10",position:"relative",background:ds.bgColor||"#3B1F0E",display:"flex",alignItems:"center",justifyContent:"center"}}>
                 {/* Slide image */}
                 {(ds.slideshowImages||[]).length>0 && (
                   <img src={(ds.slideshowImages||[])[slidePreviewIdx]?.dataUrl} alt=""
@@ -1359,16 +1501,60 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
               </div>
               <div style={{fontSize:11,color:T.inkLight,textAlign:"center"}}>
                 {(ds.slideshowImages||[]).length>0
-                  ? `ตัวอย่างจอลูกค้า · กดจุดด้านล่างเพื่อสลับภาพ · สลับอัตโนมัติทุก ${ds.slideshowInterval||5} วิ`
+                  ? ("ตัวอย่างจอลูกค้า · กดจุดด้านล่างเพื่อสลับภาพ · สลับอัตโนมัติทุก " + (ds.slideshowInterval||5) + " วิ")
                   : "เพิ่มภาพเพื่อดูตัวอย่าง"}
+              </div>
+            </>
+          )}
+          {/* ── GITHUB SYNC TAB ── */}
+          {tab==="github" && (
+            <>
+              <div style={{background:T.cream,borderRadius:12,padding:"14px",display:"flex",flexDirection:"column",gap:12}}>
+                <div style={{fontSize:13,fontWeight:700,color:T.ink}}>☁️ ตั้งค่าการซิงค์ผ่าน GitHub</div>
+                <div style={{fontSize:11,color:T.inkMid}}>ใช้สำหรับส่งยอดขายและอัปเดตเมนูข้ามเครื่องผ่านระบบคลาวด์</div>
+
+                <div>
+                  <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>GitHub Personal Access Token (PAT)</div>
+                  <input type="password" value={gs.token||""} onChange={e=>setGs(p=>({...p,token:e.target.value}))} placeholder="ghp_xxxxxxxxxxxx"
+                    style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
+                  <div style={{fontSize:10,color:T.caramel,marginTop:4}}>* สร้างได้จาก GitHub Settings > Developer settings > Tokens (classic)</div>
+                </div>
+
+                <div style={{display:"flex",gap:10}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>GitHub Owner</div>
+                    <input value={gs.owner||""} onChange={e=>setGs(p=>({...p,owner:e.target.value}))} placeholder="เช่น Prat-ppw"
+                      style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:12,color:T.inkMid,marginBottom:4}}>GitHub Repo</div>
+                    <input value={gs.repo||""} onChange={e=>setGs(p=>({...p,repo:e.target.value}))} placeholder="เช่น Comeon-Pos"
+                      style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,boxSizing:"border-box"}}/>
+                  </div>
+                </div>
+
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:T.white,borderRadius:10,padding:"10px"}}>
+                  <div>
+                    <div style={{fontWeight:700,fontSize:13,color:T.ink}}>ซิงค์อัตโนมัติ</div>
+                    <div style={{fontSize:11,color:T.inkMid}}>ส่งยอดขายขึ้น GitHub ทันทีเมื่อจบออเดอร์</div>
+                  </div>
+                  <Toggle on={gs.autoSync} onToggle={()=>setGs(p=>({...p,autoSync:!p.autoSync}))}/>
+                </div>
+              </div>
+
+              <div style={{background:"#EBF5FF",borderRadius:10,padding:"12px",fontSize:11,color:"#2563EB",lineHeight:1.6}}>
+                💡 <b>วิธีเช็คยอดจากมือถือ:</b><br/>
+                1. เปิดแอปนี้บนมือถือ (ใช้ URL เดียวกัน)<br/>
+                2. ตั้งค่า GitHub ให้ตรงกัน (ใส่ Token เดียวกัน)<br/>
+                3. กดปุ่ม 🔄 ในหน้า POS เพื่อดึงเมนูและยอดขายล่าสุด
               </div>
             </>
           )}
         </div>
 
-        <div style={{padding:"14px 20px",borderTop:`1px solid ${T.border}`,display:"flex",gap:8}}>
-          <button onClick={onClose} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>ยกเลิก</button>
-          <button onClick={()=>{ onSave({...s, receiptStyle:rs}); onSaveTax(tx); onSaveDisplay&&onSaveDisplay(ds); onClose(); }}
+        <div style={{padding:"14px 20px",borderTop:('1px solid ' + T.border),display:"flex",gap:8}}>
+          <button onClick={onClose} style={{flex:1,padding:"11px",borderRadius:10,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>ยกเลิก</button>
+          <button onClick={()=>{ onSave({...s, receiptStyle:rs}); onSaveTax(tx); onSaveDisplay&&onSaveDisplay(ds); onSaveGithub&&onSaveGithub(gs); onClose(); }}
             style={{flex:2,padding:"11px",borderRadius:10,border:"none",background:T.coffee,color:T.white,cursor:"pointer",fontSize:14,fontWeight:700}}>💾 บันทึก</button>
         </div>
       </div>
@@ -1384,30 +1570,159 @@ function PrinterSettingsModal({ settings, taxSettings, displaySettings, onSave, 
 // ─────────────────────────────────────────────────────────────
 function buildCustomerHTML(modGroupsJSON, isSunmi=false, displayCfg={}){
   const bg=displayCfg.bgColor||"#3B1F0E", acc=displayCfg.accentColor||"#C8813A";
-  const slides=displayCfg.slideshowImages||[];
-  const iv=(displayCfg.slideshowInterval||5)*1000;
-  return `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>จอลูกค้า</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Kanit',sans-serif;background:${bg};color:#FDF8F3;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
-.logo{font-size:42px;text-align:center}.name{color:${acc};font-size:20px;font-weight:700;letter-spacing:3px;margin-top:6px;text-align:center}
-.wrap{width:100%;max-width:500px;margin-top:20px}.irow{padding:10px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between}
-.grand{display:flex;justify-content:space-between;padding:12px 0;border-top:2px solid rgba(255,255,255,0.15);margin-top:10px}.gvl{color:${acc};font-weight:700;font-size:24px}</style></head>
-<body><div class="logo">☕</div><div class="name">BREW COFFEE</div>
-<div class="wrap"><div id="items"><div style="text-align:center;color:rgba(255,255,255,0.4);padding:40px">ยินดีต้อนรับ 🙏</div></div>
-<div id="totals"></div><div id="qr"></div></div>
-<script>
-var MG=${modGroupsJSON};
-function fmt(n){return n.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});}
-function sl(s){var p=[];Object.entries(s||{}).forEach(function(e){var g=MG[e[0]];if(!g)return;var ids=Array.isArray(e[1])?e[1]:[e[1]];ids.forEach(function(id){var o=g.options.find(function(x){return x.id===id});if(o)p.push(o.label);});});return p.join(' · ');}
-window.addEventListener('message',function(e){
-  var d=e.data; if(!d||!d.type) return;
-  var ia=document.getElementById('items'),ta=document.getElementById('totals'),qa=document.getElementById('qr');
-  if(!d.cart||!d.cart.length){ia.innerHTML='<div style="text-align:center;color:rgba(255,255,255,0.4);padding:40px">ยินดีต้อนรับ 🙏</div>';ta.innerHTML='';qa.innerHTML='';return;}
-  ia.innerHTML=d.cart.map(function(it){var lb=sl(it.selections||{});return '<div class="irow"><span>'+it.emoji+' '+it.name+(lb?' <small style="opacity:.6">'+lb+'</small>':'')+'</span><span style="color:${acc}">฿'+fmt(it.unitPrice*it.qty)+'</span></div>';}).join('');
-  ta.innerHTML='<div class="grand"><span style="font-weight:700">ยอดชำระ</span><span class="gvl">฿'+fmt(d.total)+'</span></div>';
-  if(d.showQR&&d.qrUrl)qa.innerHTML='<div style="text-align:center;margin-top:12px"><img src="'+d.qrUrl+'" width="180" style="border-radius:10px;background:#fff;padding:6px"/><div style="color:${acc};font-weight:700;font-size:20px;margin-top:6px">฿'+fmt(d.total)+'</div></div>';
-  else qa.innerHTML='';
-});
-</script></body></html>\`;
+  const slidesJSON = JSON.stringify(displayCfg.slideshowImages || []);
+  const interval = (displayCfg.slideshowInterval || 5) * 1000;
+
+  return '<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>จอลูกค้า</title>' +
+'<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:\'Kanit\',sans-serif;background:' + bg + ';color:#FDF8F3;height:100vh;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center}' +
+'.slide-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity 1s ease-in-out;z-index:1}' +
+'.slide-bg.active{opacity:0.6}.overlay{position:relative;z-index:10;width:100%;height:100%;display:flex;flex-direction:column;padding:40px;background:rgba(0,0,0,0.2)}' +
+'.idle-msg{margin:auto;text-align:center}.idle-msg h1{font-size:48px;letter-spacing:4px;color:' + acc + '} ' +
+'.cart-view{display:none;width:100%;height:100%;flex-direction:column}' +
+'.irow{padding:15px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;font-size:24px}' +
+'.grand{display:flex;justify-content:space-between;padding:20px 0;border-top:3px solid ' + acc + ';margin-top:auto}.gvl{color:' + acc + ';font-weight:700;font-size:42px}' +
+'.qr-wrap{text-align:center;margin-top:20px;padding:20px;background:#fff;border-radius:20px;align-self:center}</style></head>' +
+'<body><div id="slides-container"></div>' +
+'<div class="overlay"><div id="idle-ui" class="idle-msg"><h1>BREW COFFEE</h1><p style="font-size:24px;margin-top:10px;opacity:0.8">ยินดีต้อนรับครับ 🙏</p></div>' +
+'<div id="cart-ui" class="cart-view">' +
+'  <div style="font-size:32px;font-weight:700;margin-bottom:20px;border-bottom:2px solid #fff;padding-bottom:10px">รายการที่สั่ง</div>' +
+'  <div id="items-list" style="flex:1;overflow:hidden"></div>' +
+'  <div id="qr-area" style="display:none" class="qr-wrap"><img id="qr-img" src="" width="300"/><div id="qr-total" style="color:#000;font-weight:700;font-size:32px;margin-top:10px"></div></div>' +
+'  <div class="grand"><span>ยอดรวม</span><span id="grand-total" class="gvl"></span></div>' +
+'</div></div>' +
+'<script>' +
+'var MG=' + modGroupsJSON + '; var SLIDES=' + slidesJSON + '; var curSlide=0;' +
+'function initSlides(){ if(!SLIDES.length) return; var cont=document.getElementById("slides-container"); SLIDES.forEach(function(s,i){ var img=document.createElement("img"); img.src=s.dataUrl; img.className="slide-bg"+(i===0?" active":""); cont.appendChild(img); }); if(SLIDES.length>1) setInterval(nextSlide, ' + interval + '); }' +
+'function nextSlide(){ var imgs=document.querySelectorAll(".slide-bg"); imgs[curSlide].classList.remove("active"); curSlide=(curSlide+1)%imgs.length; imgs[curSlide].classList.add("active"); }' +
+'function fmt(n){return n.toLocaleString(\'th-TH\',{minimumFractionDigits:2,maximumFractionDigits:2});}' +
+'window.addEventListener(\'message\',function(e){' +
+'  var d=e.data; if(!d||!d.type) return;' +
+'  var idle=document.getElementById("idle-ui"), cart=document.getElementById("cart-ui"), list=document.getElementById("items-list"), qr=document.getElementById("qr-area");' +
+'  if(!d.cart||!d.cart.length){ idle.style.display="block"; cart.style.display="none"; return; }' +
+'  idle.style.display="none"; cart.style.display="flex";' +
+'  list.innerHTML=d.cart.map(function(it){ return \'<div class="irow"><span>\'+it.emoji+\' \'+it.name+\' x\'+it.qty+\'</span><span style="color:' + acc + '">฿\'+fmt(it.unitPrice*it.qty)+\'</span></div>\'; }).join("");' +
+'  document.getElementById("grand-total").innerText="฿"+fmt(d.total);' +
+'  if(d.showQR&&d.qrUrl){ qr.style.display="block"; document.getElementById("qr-img").src=d.qrUrl; document.getElementById("qr-total").innerText="฿"+fmt(d.total); list.style.display="none"; }' +
+'  else { qr.style.display="none"; list.style.display="block"; }' +
+'}); initSlides();' +
+'</script></body></html>';
+}
+
+// ─────────────────────────────────────────────────────────────
+// GITHUB SYNC ENGINE
+// ─────────────────────────────────────────────────────────────
+async function pushToGithub(filename, content, settings, setMsg) {
+  if (!settings?.token || !settings?.owner || !settings?.repo) {
+    if (setMsg) setMsg("⚠️ ตั้งค่า GitHub ไม่ครบ");
+    return false;
+  }
+
+  const url = "https://api.github.com/repos/" + settings.owner + "/" + settings.repo + "/contents/" + filename;
+  const auth = "Bearer " + settings.token;
+
+  try {
+    // 1. Get existing file SHA (needed for update)
+    let sha = null;
+    const getRes = await fetch(url, { headers: { "Authorization": auth } });
+    if (getRes.ok) {
+      const data = await getRes.json();
+      sha = data.sha;
+    }
+
+    // 2. Push new content
+    const body = {
+      message: "Update " + filename + " from Brew POS",
+      content: btoa(unescape(encodeURIComponent(JSON.stringify(content, null, 2)))),
+      sha: sha
+    };
+
+    const putRes = await fetch(url, {
+      method: "PUT",
+      headers: { "Authorization": auth, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    if (putRes.ok) {
+      if (setMsg) setMsg("✅ ซิงค์ " + filename + " สำเร็จ");
+      return true;
+    } else {
+      const err = await putRes.json();
+      throw new Error(err.message);
+    }
+  } catch (e) {
+    console.error("Github Sync Error:", e);
+    if (setMsg) setMsg("❌ Error: " + e.message);
+    return false;
+  }
+}
+
+function GithubPatchUpdater() {
+  const { githubSettings, setMenuItems, setOrders } = useApp();
+  const [isUpdating, setIsUpdating] = useState(false);
+
+  async function downloadAndApplyPatch() {
+    if (!githubSettings?.token) {
+      alert("กรุณาตั้งค่า GitHub Token ในหน้าตั้งค่าก่อนครับ");
+      return;
+    }
+    setIsUpdating(true);
+    try {
+      const auth = "Bearer " + githubSettings.token;
+      const baseUrl = "https://api.github.com/repos/" + githubSettings.owner + "/" + githubSettings.repo + "/contents/";
+
+      // 1. Fetch Menu
+      const resMenu = await fetch(baseUrl + "menu-patch.json", { headers: { "Authorization": auth } });
+      if (resMenu.ok) {
+        const data = await resMenu.json();
+        const content = JSON.parse(decodeURIComponent(escape(atob(data.content))));
+        if (content.products) setMenuItems(content.products);
+      }
+
+      // 2. Fetch Sales (Orders)
+      const resSales = await fetch(baseUrl + "sales-report.json", { headers: { "Authorization": auth } });
+      if (resSales.ok) {
+        const data = await resSales.json();
+        const content = JSON.parse(decodeURIComponent(escape(atob(data.content))));
+        if (content.orders) setOrders(content.orders);
+      }
+
+      alert("ซิงค์ข้อมูลเมนูและยอดขายล่าสุดจาก GitHub สำเร็จ!");
+    } catch (error) {
+      alert("การซิงค์ล้มเหลว: " + error.message);
+      console.error(error);
+    } finally {
+      setIsUpdating(false);
+    }
+  }
+
+  return (
+    <div style={{ padding: '12px', background: T.white, borderRadius: '12px', border: ('1px solid ' + T.border), margin: '10px 14px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <h4 style={{ margin: 0, fontSize: '13px', color: T.ink }}>🔄 อัปเดตรายการเครื่องดื่ม</h4>
+        {isUpdating && <span style={{ fontSize: '11px', color: T.caramel }}>กำลังโหลด...</span>}
+      </div>
+      <p style={{ margin: '0 0 10px 0', fontSize: '11px', color: T.inkMid }}>
+        ดึงราคาและเมนูเครื่องดื่มใหม่ล่าสุดจาก GitHub
+      </p>
+      <button
+        onClick={downloadAndApplyPatch}
+        disabled={isUpdating}
+        style={{
+          width: '100%',
+          padding: '8px',
+          background: isUpdating ? T.border : T.caramel,
+          color: T.white,
+          border: 'none',
+          borderRadius: '8px',
+          fontWeight: 'bold',
+          fontSize: '12px',
+          cursor: isUpdating ? 'not-allowed' : 'pointer'
+        }}
+      >
+        {isUpdating ? 'กำลังโหลดข้อมูล...' : '📥 ตรวจสอบและอัปเดตราคาหน้าร้าน'}
+      </button>
+    </div>
+  );
 }
 
 function Sidebar({ view, setView, cartCount, onSettings, heldCount }){
@@ -1468,7 +1783,7 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
     setHoldPrompt(true);
   }
   async function confirmHoldPrompt(){
-    const label = holdLabelInput.trim() || `บิล ${heldOrders.length+1}`;
+    const label = holdLabelInput.trim() || 'บิล ' + (heldOrders.length + 1);
     let id = activeHeldId;
     if(id) onUpdateHeld(id, cart, label);
     else id = onHold(label, cart);
@@ -1487,9 +1802,9 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
 
   function handleMenuClick(item){ if(item.available===false) return; if(item.modifiers.length>0) setModal(item); else addPlain(item); }
   function addPlain(item){
-    setCart(prev=>{ const ex=prev.find(c=>c.id===item.id&&Object.keys(c.selections||{}).length===0); if(ex) return prev.map(c=>c._key===ex._key?{...c,qty:c.qty+1}:c); return[...prev,{...item,qty:1,unitPrice:item.price,selections:{},note:"",_key:++keyRef.current}]; });
+    setCart(prev=>{ const ex=prev.find(c=>c.id===item.id&&Object.keys(c.selections||{}).length===0); if(ex) return prev.map(c=>c._key===ex._key?{...c,qty:c.qty+1}:c); return[...prev,{...item,qty:1,unitPrice:item.price,selections:{},note:"",_key:genId("cart")}]; });
   }
-  function handleModalConfirm(d){ setCart(prev=>[...prev,{...d.item,qty:d.qty,unitPrice:d.unitPrice,selections:d.selections,note:d.note,_key:++keyRef.current}]); setModal(null); }
+  function handleModalConfirm(d){ setCart(prev=>[...prev,{...d.item,qty:d.qty,unitPrice:d.unitPrice,selections:d.selections,note:d.note,_key:genId("cart")}]); setModal(null); }
   function updateQty(key,delta){ setCart(prev=>prev.map(c=>c._key===key?{...c,qty:c.qty+delta}:c).filter(c=>c.qty>0)); }
 
   const subtotal = cart.reduce((s,c)=>s+c.unitPrice*c.qty, 0);
@@ -1544,10 +1859,10 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
             <div style={{fontSize:12,color:T.inkMid,marginBottom:14}}>ใส่โต๊ะ/ชื่อลูกค้า เพื่อเรียกบิลนี้กลับมาทีหลัง{printerSettings?.enabled?" — จะพิมพ์ใบออเดอร์ให้ครัวด้วยอัตโนมัติ":""}</div>
             <input autoFocus value={holdLabelInput} onChange={e=>setHoldLabelInput(e.target.value)}
               onKeyDown={e=>{ if(e.key==="Enter") confirmHoldPrompt(); }}
-              placeholder={`เช่น โต๊ะ 4, คุณเอ (เว้นว่าง = บิล ${heldOrders.length+1})`}
-              style={{width:"100%",padding:"10px 13px",borderRadius:10,border:`1.5px solid ${T.caramel}`,fontSize:14,fontWeight:600,boxSizing:"border-box",marginBottom:16}}/>
+              placeholder={'เช่น โต๊ะ 4, คุณเอ (เว้นว่าง = บิล ' + (heldOrders.length + 1) + ')'}
+              style={{width:"100%",padding:"10px 13px",borderRadius:10,border:'1.5px solid ' + T.caramel,fontSize:14,fontWeight:600,boxSizing:"border-box",marginBottom:16}}/>
             <div style={{display:"flex",gap:8}}>
-              <button onClick={()=>setHoldPrompt(false)} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600,color:T.ink}}>ยกเลิก</button>
+              <button onClick={()=>setHoldPrompt(false)} style={{flex:1,padding:"11px",borderRadius:10,border:'1px solid ' + T.border,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600,color:T.ink}}>ยกเลิก</button>
               <button onClick={confirmHoldPrompt} style={{flex:1.4,padding:"11px",borderRadius:10,border:"none",background:T.coffee,color:T.white,cursor:"pointer",fontSize:13,fontWeight:700}}>📑 ส่งค้างไว้</button>
             </div>
           </div>
@@ -1556,17 +1871,18 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
 
       {/* ── Delete held order confirmation ── */}
       {confirmDeleteHeld&&<ConfirmDialog title="ลบบิลค้าง?"
-        message={`ลบบิล "${confirmDeleteHeld.label}" ทิ้งถาวร?\nไม่สามารถย้อนกลับได้`}
+        message={'ลบบิล "' + confirmDeleteHeld.label + '" ทิ้งถาวร?\nไม่สามารถย้อนกลับได้'}
         confirmLabel="ลบบิล" danger
         onConfirm={()=>{ onRemoveHeld(confirmDeleteHeld.id); setConfirmDeleteHeld(null); }}
         onCancel={()=>setConfirmDeleteHeld(null)}/>}
 
 
       {/* ── Header: search only (held bills are now in the ออเดอร์ tab) ── */}
-      <div style={{background:T.white,borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+      <div style={{background:T.white,borderBottom:'1px solid ' + T.border,flexShrink:0}}>
+        <GithubPatchUpdater />
         <div style={{padding:"10px 14px"}}>
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍  ค้นหาเมนู..."
-            style={{width:"100%",padding:"8px 13px",borderRadius:10,border:`1px solid ${T.border}`,fontSize:13,outline:"none",background:T.cream,boxSizing:"border-box"}}/>
+            style={{width:"100%",padding:"8px 13px",borderRadius:10,border:'1px solid ' + T.border,fontSize:13,outline:"none",background:T.cream,boxSizing:"border-box"}}/>
         </div>
         {activeHeldId&&heldOrders.find(h=>h.id===activeHeldId)&&(
           <div style={{padding:"0 14px 9px",display:"flex",alignItems:"center",gap:8}}>
@@ -1586,7 +1902,7 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
             const soldOut = item.available===false;
             return(
               <div key={item.id} onClick={()=>handleMenuClick(item)}
-                style={{background:T.white,borderRadius:13,border:count>0?`2px solid ${T.caramel}`:`1px solid ${T.border}`,overflow:"hidden",cursor:soldOut?"not-allowed":"pointer",boxShadow:count>0?"0 2px 16px rgba(200,129,58,0.25)":"0 1px 5px rgba(0,0,0,0.05)",transition:"transform 0.12s,box-shadow 0.12s,border 0.12s",position:"relative",opacity:soldOut?0.5:1}}
+                style={{background:T.white,borderRadius:13,border:count>0?('2px solid ' + T.caramel):('1px solid ' + T.border),overflow:"hidden",cursor:soldOut?"not-allowed":"pointer",boxShadow:count>0?"0 2px 16px rgba(200,129,58,0.25)":"0 1px 5px rgba(0,0,0,0.05)",transition:"transform 0.12s,box-shadow 0.12s,border 0.12s",position:"relative",opacity:soldOut?0.5:1}}
                 onMouseEnter={e=>{ if(soldOut) return; e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 6px 20px rgba(0,0,0,0.1)";}}
                 onMouseLeave={e=>{ if(soldOut) return; e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=count>0?"0 2px 16px rgba(200,129,58,0.25)":"0 1px 5px rgba(0,0,0,0.05)";}}>
                 {soldOut&&<div style={{position:"absolute",inset:0,background:"rgba(253,248,243,0.4)",zIndex:3}}/>}
@@ -1628,13 +1944,13 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
       </div>
 
       {/* ── Bottom category tab bar — always its own row, never covered ── */}
-      <div style={{background:T.white,borderTop:`1px solid ${T.border}`,display:"flex",overflowX:"auto",flexShrink:0,scrollbarWidth:"none",position:"relative",zIndex:10}}>
+      <div style={{background:T.white,borderTop:('1px solid ' + T.border),display:"flex",overflowX:"auto",flexShrink:0,scrollbarWidth:"none",position:"relative",zIndex:10}}>
         {CATS.map(c=>{
           const active=cat===c;
           const info=(catInfo&&catInfo[c])||CAT_INFO[c]||{icon:"☕"};
           const cnt=c==="ทั้งหมด"?menuItems.length:menuItems.filter(m=>m.cat===c).length;
           return(
-            <button key={c} onClick={()=>setCat(c)} style={{flex:"0 0 auto",minWidth:72,padding:"9px 6px 7px",border:"none",cursor:"pointer",background:"transparent",display:"flex",flexDirection:"column",alignItems:"center",gap:2,borderTop:active?`3px solid ${T.caramel}`:"3px solid transparent",transition:"all 0.15s"}}>
+            <button key={c} onClick={()=>setCat(c)} style={{flex:"0 0 auto",minWidth:72,padding:"9px 6px 7px",border:"none",cursor:"pointer",background:"transparent",display:"flex",flexDirection:"column",alignItems:"center",gap:2,borderTop:active?('3px solid ' + T.caramel):"3px solid transparent",transition:"all 0.15s"}}>
               <span style={{fontSize:20,lineHeight:1}}>{info.icon}</span>
               <span style={{fontSize:10,fontWeight:active?700:500,color:active?T.caramel:T.inkMid,whiteSpace:"nowrap"}}>{c}</span>
               <span style={{fontSize:9,color:T.inkLight}}>{cnt}</span>
@@ -1654,7 +1970,7 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
             <div style={{padding:"10px 0 0",display:"flex",flexDirection:"column",alignItems:"center",flexShrink:0}}>
               <div style={{width:40,height:4,background:T.border,borderRadius:2,marginBottom:10}}/>
             </div>
-            <div style={{padding:"0 18px 10px",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+            <div style={{padding:"0 18px 10px",borderBottom:('1px solid ' + T.border),display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
               <span style={{fontWeight:700,fontSize:15,color:T.ink}}>🛒 รายการสั่ง ({totalQty} รายการ)</span>
               <div style={{display:"flex",gap:10}}>
                 <button onClick={()=>setConfirmClear(true)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:T.red,fontWeight:600}}>ล้างทั้งหมด</button>
@@ -1666,7 +1982,7 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
               {cart.map(item=>{
                 const mods=getModDetails(item.selections||{}, mgMap);
                 return(
-                  <div key={item._key} style={{padding:"10px 18px",borderBottom:`1px solid ${T.border}`}}>
+                  <div key={item._key} style={{padding:"10px 18px",borderBottom:('1px solid ' + T.border)}}>
                     <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:6}}>
                       <ItemThumb item={item} size={38} radius={8} style={{flexShrink:0,marginTop:1}}/>
                       <div style={{flex:1,minWidth:0}}>
@@ -1683,9 +1999,9 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
                         {item.note&&<div style={{fontSize:10,color:T.inkLight,marginTop:2}}>📝 {item.note}</div>}
                       </div>
                     </div>
-                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingTop:6,borderTop:`1px dashed ${T.border}`}}>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingTop:6,borderTop:('1px dashed ' + T.border)}}>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
-                        <button onClick={()=>updateQty(item._key,-1)} style={{width:24,height:24,borderRadius:7,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                        <button onClick={()=>updateQty(item._key,-1)} style={{width:24,height:24,borderRadius:7,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
                         <span style={{fontSize:14,fontWeight:700,color:T.ink,minWidth:18,textAlign:"center"}}>{item.qty}</span>
                         <button onClick={()=>updateQty(item._key,1)} style={{width:24,height:24,borderRadius:7,border:"none",background:T.caramel,cursor:"pointer",fontSize:14,fontWeight:700,color:T.white,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
                       </div>
@@ -1699,15 +2015,15 @@ function POSView({ cart, setCart, printerSettings, kitchenPrinterSettings, custo
               })}
             </div>
             {/* Summary + pay */}
-            <div style={{padding:"14px 18px",borderTop:`1px solid ${T.border}`,flexShrink:0}}>
+            <div style={{padding:"14px 18px",borderTop:('1px solid ' + T.border),flexShrink:0}}>
               {tax.scEnabled&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:5}}><span style={{color:T.inkMid}}>SC {tax.scPct}%</span><span style={{color:T.inkMid}}>฿{fmt(scAmt)}</span></div>}
               {tax.vatEnabled&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:5}}><span style={{color:T.inkMid}}>VAT {tax.vatPct}%{tax.vatInclusive?" (รวม)":""}</span><span style={{color:T.inkMid}}>฿{fmt(vatAmt)}</span></div>}
-              <div style={{display:"flex",justifyContent:"space-between",paddingTop:8,borderTop:`2px solid ${T.ink}`,marginBottom:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",paddingTop:8,borderTop:('2px solid ' + T.ink),marginBottom:14}}>
                 <span style={{fontSize:16,fontWeight:700,color:T.ink}}>ยอดชำระ</span>
                 <span style={{fontSize:18,fontWeight:700,color:T.caramel}}>฿{fmt(grandTotal)}</span>
               </div>
               <div style={{display:"flex",gap:8,marginBottom:8}}>
-                <button onClick={openHoldPrompt} style={{flex:1,padding:"11px",borderRadius:11,border:`1.5px solid ${T.border}`,background:T.cream,color:T.ink,fontSize:13,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>
+                <button onClick={openHoldPrompt} style={{flex:1,padding:"11px",borderRadius:11,border:('1.5px solid ' + T.border),background:T.cream,color:T.ink,fontSize:13,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>
                   📑 ส่งค้างไว้
                 </button>
                 <button onClick={()=>{setCartOpen(false);setPayModal(true);}} style={{flex:2,padding:"11px",borderRadius:11,border:"none",background:T.coffee,color:T.white,fontSize:14,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>
@@ -1744,13 +2060,13 @@ function OrdersView({ orders, onUpdateStatus, heldOrders, onRemoveHeld, onResume
   return(
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:T.cream}}>
       {confirmDeleteHeld&&<ConfirmDialog title="ลบบิลค้าง?"
-        message={`ลบบิล "${confirmDeleteHeld.label}" ทิ้งถาวร?\nไม่สามารถย้อนกลับได้`}
+        message={("ลบบิล \"" + confirmDeleteHeld.label + "\" ทิ้งถาวร?\nไม่สามารถย้อนกลับได้")}
         confirmLabel="ลบบิล" danger
         onConfirm={()=>{ onRemoveHeld(confirmDeleteHeld.id); setConfirmDeleteHeld(null); }}
         onCancel={()=>setConfirmDeleteHeld(null)}/>}
 
       {/* ── Tab bar ── */}
-      <div style={{display:"flex",background:T.white,borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+      <div style={{display:"flex",background:T.white,borderBottom:('1px solid ' + T.border),flexShrink:0}}>
         {[
           {id:"held",  label:"บิลค้าง",      badge: heldOrders.length||null},
           {id:"done",  label:"ออเดอร์สำเร็จ", badge: todayOrders.length||null},
@@ -1758,7 +2074,7 @@ function OrdersView({ orders, onUpdateStatus, heldOrders, onRemoveHeld, onResume
           <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"13px 8px",border:"none",cursor:"pointer",fontWeight:700,fontSize:13,
             background:tab===t.id?T.cream:T.white,
             color:tab===t.id?T.caramel:T.inkMid,
-            borderBottom:tab===t.id?`3px solid ${T.caramel}`:"3px solid transparent",
+            borderBottom:tab===t.id?('3px solid ' + T.caramel):"3px solid transparent",
             display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"all 0.15s"}}>
             {t.id==="held"?"📑":"✅"} {t.label}
             {t.badge!=null&&<span style={{background:tab===t.id?T.caramel:"#E0D8D0",color:tab===t.id?T.white:T.inkMid,borderRadius:12,fontSize:11,fontWeight:700,padding:"1px 7px"}}>{t.badge}</span>}
@@ -1781,9 +2097,9 @@ function OrdersView({ orders, onUpdateStatus, heldOrders, onRemoveHeld, onResume
             const hQty  = h.items.reduce((s,c)=>s+c.qty,0);
             const hTime = new Date(h.createdAt).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"});
             return(
-              <div key={h.id} style={{background:T.white,borderRadius:14,border:`1px solid ${T.border}`,marginBottom:10,overflow:"hidden",boxShadow:"0 1px 6px rgba(0,0,0,0.05)"}}>
+              <div key={h.id} style={{background:T.white,borderRadius:14,border:('1px solid ' + T.border),marginBottom:10,overflow:"hidden",boxShadow:"0 1px 6px rgba(0,0,0,0.05)"}}>
                 {/* card header */}
-                <div style={{padding:"12px 14px",display:"flex",alignItems:"center",gap:10,borderBottom:`1px solid ${T.border}`}}>
+                <div style={{padding:"12px 14px",display:"flex",alignItems:"center",gap:10,borderBottom:('1px solid ' + T.border)}}>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:15,fontWeight:700,color:T.ink}}>{h.label}</div>
                     <div style={{fontSize:11,color:T.inkMid,marginTop:2}}>{hTime} น. · {hQty} รายการ · <span style={{color:T.caramel,fontWeight:700}}>฿{fmt(hTotal)}</span></div>
@@ -1829,7 +2145,7 @@ function OrdersView({ orders, onUpdateStatus, heldOrders, onRemoveHeld, onResume
             const timeStr = new Date(o.time).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"});
             const orderNo = todayOrders.length-idx;
             return(
-              <div key={o.id} style={{background:T.white,borderRadius:12,padding:"12px 14px",border:`1px solid ${T.border}`,marginBottom:8}}>
+              <div key={o.id} style={{background:T.white,borderRadius:12,padding:"12px 14px",border:('1px solid ' + T.border),marginBottom:8}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
                   <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
                     <span style={{fontWeight:700,color:T.ink,fontSize:13}}>ออเดอร์ #{orderNo}</span>
@@ -1907,7 +2223,7 @@ function ReportsView({ orders }){
     {label:"ยอดขายวันนี้", value:"฿"+fmtInt(todaySales), delta: salesDelta===null?null:(salesDelta>=0?"+":"")+salesDelta+"%", up: salesDelta===null||salesDelta>=0},
     {label:"จำนวนออเดอร์", value:String(todayCount), delta: (countDelta>=0?"+":"")+String(countDelta), up: countDelta>=0},
     {label:"เฉลี่ย/ออเดอร์", value:"฿"+(todayCount>0?fmtInt(Math.round(avgPerOrder)):"0"), delta:null, up:true},
-    {label:"เมนูขายดี", value: topItem, delta: topQty>0?`${topQty} รายการ`:null, up:true},
+    {label:"เมนูขายดี", value: topItem, delta: topQty>0?(topQty + " รายการ"):null, up:true},
   ];
 
   return(
@@ -1915,14 +2231,14 @@ function ReportsView({ orders }){
       <h2 style={{fontSize:18,fontWeight:700,color:T.ink,marginBottom:16}}>รายงานการขาย</h2>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:10,marginBottom:18}}>
         {stats.map(s=>(
-          <div key={s.label} style={{background:T.white,borderRadius:12,padding:14,border:`1px solid ${T.border}`}}>
+          <div key={s.label} style={{background:T.white,borderRadius:12,padding:14,border:('1px solid ' + T.border)}}>
             <div style={{fontSize:11,color:T.inkMid,marginBottom:4}}>{s.label}</div>
             <div style={{fontSize:19,fontWeight:700,color:T.ink,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.value}</div>
             {s.delta!=null && <div style={{fontSize:11,color:s.up?T.mint:T.red,fontWeight:600}}>{s.up?"▲":"▼"} {s.delta}</div>}
           </div>
         ))}
       </div>
-      <div style={{background:T.white,borderRadius:12,padding:16,border:`1px solid ${T.border}`}}>
+      <div style={{background:T.white,borderRadius:12,padding:16,border:('1px solid ' + T.border)}}>
         <div style={{fontSize:13,fontWeight:700,color:T.ink,marginBottom:12}}>ยอดขายรายวัน (7 วันล่าสุด)</div>
         {!hasAnyData && <div style={{fontSize:12,color:T.inkLight,marginBottom:10}}>ยังไม่มีข้อมูลการขาย — กราฟจะเริ่มแสดงผลหลังมีออเดอร์แรกของร้าน</div>}
         <div style={{display:"flex",alignItems:"flex-end",gap:8,height:120}}>
@@ -1931,7 +2247,7 @@ function ReportsView({ orders }){
             return(
               <div key={d.key} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
                 <div style={{fontSize:10,color:T.inkMid}}>{s>=1000?(s/1000).toFixed(1)+"k":fmtInt(s)}</div>
-                <div style={{width:"100%",background:T.caramel,borderRadius:"5px 5px 0 0",height:`${Math.max(2,(s/mx)*100)}px`,opacity:d.key===todayKey?1:0.55}}/>
+                <div style={{width:"100%",background:T.caramel,borderRadius:"5px 5px 0 0",height:String(Math.max(2,(s/mx)*100)) + "px",opacity:d.key===todayKey?1:0.55}}/>
                 <div style={{fontSize:11,color:T.inkMid,fontWeight:600}}>{d.label}</div>
               </div>
             );
@@ -1979,7 +2295,7 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
       {groupDeleteNotice&&<ConfirmDialog message={'ลบกลุ่มตัวเลือกทั้งกลุ่มได้จากหน้า "ตัวเลือก & หมวดหมู่" เท่านั้น เพื่อให้ระบบจัดการผลกับเมนูอื่นที่ใช้งานร่วมกันได้อย่างปลอดภัย'} confirmLabel="เข้าใจแล้ว" onConfirm={()=>setGroupDeleteNotice(false)} onCancel={null}/>}
       <div style={{background:T.white,borderRadius:20,width:"100%",maxWidth:500,maxHeight:"94vh",display:"flex",flexDirection:"column",boxShadow:"0 24px 72px rgba(0,0,0,0.32)"}}>
         {/* Header */}
-        <div style={{padding:"14px 18px",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+        <div style={{padding:"14px 18px",borderBottom:('1px solid ' + T.border),display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
           <span style={{fontWeight:700,fontSize:15,color:T.ink}}>{isNew?"➕ เพิ่มเมนูใหม่":"✏️ แก้ไขเมนู"}</span>
           <button onClick={onClose} style={{width:28,height:28,borderRadius:"50%",border:"none",background:T.border,cursor:"pointer",fontSize:15,color:T.inkMid}}>✕</button>
         </div>
@@ -1990,7 +2306,7 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
           <div style={{display:"flex",gap:14,alignItems:"flex-start"}}>
             {/* Image upload box */}
             <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} style={{display:"none"}}/>
-            <div onClick={()=>fileRef.current.click()} style={{width:114,height:114,borderRadius:14,border:`2.5px dashed ${T.caramel}`,background:"#FFF8EE",cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6}}>
+            <div onClick={()=>fileRef.current.click()} style={{width:114,height:114,borderRadius:14,border:('2.5px dashed ' + T.caramel),background:"#FFF8EE",cursor:"pointer",position:"relative",overflow:"hidden",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6}}>
               {form.image ? (
                 <>
                   <img src={form.image} alt="" style={{width:"100%",height:"100%",objectFit:"cover",position:"absolute",inset:0}}/>
@@ -2014,12 +2330,12 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
               <div>
                 <div style={{fontSize:11,color:T.inkMid,marginBottom:4}}>ชื่อเมนู *</div>
                 <input value={form.name} onChange={e=>setForm(p=>({...p,name:e.target.value}))} placeholder="เช่น ลาเต้"
-                  style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:14,fontWeight:600,boxSizing:"border-box",outline:"none"}}/>
+                  style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:14,fontWeight:600,boxSizing:"border-box",outline:"none"}}/>
               </div>
               <div>
                 <div style={{fontSize:11,color:T.inkMid,marginBottom:4}}>ราคา (บาท) *</div>
                 <input type="number" min="0" value={form.price||""} onChange={e=>setForm(p=>({...p,price:parseFloat(e.target.value)||0}))} placeholder="0"
-                  style={{width:"100%",padding:"9px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:15,fontWeight:700,color:T.caramel,boxSizing:"border-box",outline:"none"}}/>
+                  style={{width:"100%",padding:"9px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:15,fontWeight:700,color:T.caramel,boxSizing:"border-box",outline:"none"}}/>
               </div>
             </div>
           </div>
@@ -2046,7 +2362,7 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
               {CATS.map(c=>(
                 <button key={c} onClick={()=>setForm(p=>({...p,cat:c}))}
-                  style={{padding:"6px 14px",borderRadius:20,border:form.cat===c?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:form.cat===c?"#FFF8EE":T.white,color:form.cat===c?T.caramel:T.inkMid,fontWeight:form.cat===c?700:500,fontSize:13,cursor:"pointer",transition:"all 0.12s"}}>
+                  style={{padding:"6px 14px",borderRadius:20,border:form.cat===c?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:form.cat===c?"#FFF8EE":T.white,color:form.cat===c?T.caramel:T.inkMid,fontWeight:form.cat===c?700:500,fontSize:13,cursor:"pointer",transition:"all 0.12s"}}>
                   {c}
                 </button>
               ))}
@@ -2063,23 +2379,23 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
                 return(
                   <div key={g.id}>
                     <div onClick={()=>toggleMod(g.id)}
-                      style={{padding:"9px 13px",borderRadius:10,border:on?`2px solid ${T.caramel}`:`1.5px solid ${T.border}`,background:on?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,transition:"all 0.12s"}}>
-                      <span style={{width:16,height:16,borderRadius:4,border:on?`2px solid ${T.caramel}`:`1.5px solid ${T.inkLight}`,background:on?T.caramel:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:10,color:T.white,flexShrink:0}}>{on?"✓":""}</span>
+                      style={{padding:"9px 13px",borderRadius:10,border:on?('2px solid ' + T.caramel):('1.5px solid ' + T.border),background:on?"#FFF8EE":T.white,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,transition:"all 0.12s"}}>
+                      <span style={{width:16,height:16,borderRadius:4,border:on?('2px solid ' + T.caramel):('1.5px solid ' + T.inkLight),background:on?T.caramel:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:10,color:T.white,flexShrink:0}}>{on?"✓":""}</span>
                       <div style={{flex:1,minWidth:0}}>
                         <span style={{fontSize:13,fontWeight:on?700:500,color:on?T.caramel:T.ink}}>{g.label}</span>
                         <span style={{fontSize:10,color:T.inkLight,marginLeft:8}}>{g.options.slice(0,3).map(o=>o.label).join(" / ")}…</span>
                       </div>
                       <div style={{display:"flex",gap:4,flexShrink:0}}>
                     {g.required&&<span style={{fontSize:9,background:T.caramel+"28",color:T.caramel,padding:"2px 6px",borderRadius:6,fontWeight:700}}>จำเป็น</span>}
-                    {isMulti(g)&&<span style={{fontSize:9,background:"#E0F0E8",color:T.mint,padding:"2px 6px",borderRadius:6,fontWeight:700}}>{maxSel(g)>=99?"หลายอย่าง":`≤${maxSel(g)}`}</span>}
+                    {isMulti(g)&&<span style={{fontSize:9,background:"#E0F0E8",color:T.mint,padding:"2px 6px",borderRadius:6,fontWeight:700}}>{maxSel(g)>=99?"หลายอย่าง":("≤" + maxSel(g))}</span>}
                   </div>
                       <button onClick={(e)=>{ e.stopPropagation(); setExpandedGroupId(expanded?null:g.id); }}
-                        style={{flexShrink:0,padding:"4px 10px",borderRadius:7,border:`1px solid ${expanded?T.caramel:T.border}`,background:expanded?T.caramel:T.cream,color:expanded?T.white:T.inkMid,fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                        style={{flexShrink:0,padding:"4px 10px",borderRadius:7,border:('1px solid ' + (expanded?T.caramel:T.border)),background:expanded?T.caramel:T.cream,color:expanded?T.white:T.inkMid,fontSize:11,fontWeight:700,cursor:"pointer"}}>
                         {expanded?"ปิด ✕":"✏️ แก้ไข"}
                       </button>
                     </div>
                     {expanded&&(
-                      <div style={{marginTop:6,marginLeft:10,paddingLeft:10,borderLeft:`3px solid ${T.caramelLight}`}}>
+                      <div style={{marginTop:6,marginLeft:10,paddingLeft:10,borderLeft:('3px solid ' + T.caramelLight)}}>
                         <div style={{fontSize:10,color:T.inkLight,marginBottom:6}}>การแก้ไขนี้จะมีผลกับทุกเมนูที่ใช้ "{g.label}" ร่วมกัน ไม่ใช่แค่เมนูนี้</div>
                         <ModifierGroupCard group={g}
                           onUpdate={(updated)=>setModGroups(prev=>prev.map(x=>x.id===updated.id?updated:x))}
@@ -2094,9 +2410,9 @@ function EditMenuModal({ item, isNew, onSave, onDelete, onClose }){
         </div>
 
         {/* Footer */}
-        <div style={{padding:"13px 18px",borderTop:`1px solid ${T.border}`,display:"flex",gap:8,flexShrink:0}}>
+        <div style={{padding:"13px 18px",borderTop:('1px solid ' + T.border),display:"flex",gap:8,flexShrink:0}}>
           {!isNew&&<button onClick={()=>{onDelete(form.id);onClose();}} style={{padding:"11px 14px",borderRadius:10,border:"none",background:"#FFF0F0",cursor:"pointer",fontSize:13,fontWeight:700,color:T.red}}>🗑</button>}
-          <button onClick={onClose} style={{flex:1,padding:"11px",borderRadius:10,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>ยกเลิก</button>
+          <button onClick={onClose} style={{flex:1,padding:"11px",borderRadius:10,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:13,fontWeight:600}}>ยกเลิก</button>
           <button disabled={!valid} onClick={()=>{onSave(form);onClose();}}
             style={{flex:2,padding:"11px",borderRadius:10,border:"none",background:valid?T.coffee:T.border,color:T.white,cursor:valid?"pointer":"not-allowed",fontSize:14,fontWeight:700,transition:"background 0.15s"}}>
             {isNew?"✅ เพิ่มเมนู":"💾 บันทึก"}
@@ -2125,10 +2441,22 @@ function MenuManagerView({ menuItems, setMenuItems }){
     ? (cat==="ทั้งหมด" ? menuItems : menuItems.filter(m=>m.cat===cat))
     : menuItems.filter(m=>(cat==="ทั้งหมด"||m.cat===cat)&&m.name.toLowerCase().includes(search.toLowerCase()));
 
-  function saveItem(form){
-    setMenuItems(prev=>{ const ex=prev.find(x=>x.id===form.id); return ex?prev.map(x=>x.id===form.id?form:x):[...prev,form]; });
-  }
-  function deleteItem(id){ setMenuItems(prev=>prev.filter(x=>x.id!==id)); }
+  const saveItem = (form) => {
+    const newItems = menuItems.find(x => x.id === form.id)
+      ? menuItems.map(x => x.id === form.id ? form : x)
+      : [...menuItems, form];
+    setMenuItems(newItems);
+    if (githubSettings?.token) {
+      pushToGithub("menu-patch.json", { version: new Date().getTime().toString(), products: newItems }, githubSettings);
+    }
+  };
+  const deleteItem = (id) => {
+    const newItems = menuItems.filter(x => x.id !== id);
+    setMenuItems(newItems);
+    if (githubSettings?.token) {
+      pushToGithub("menu-patch.json", { version: new Date().getTime().toString(), products: newItems }, githubSettings);
+    }
+  };
 
   return(
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:T.cream}}>
@@ -2141,14 +2469,14 @@ function MenuManagerView({ menuItems, setMenuItems }){
       )}
 
       {/* Toolbar */}
-      <div style={{padding:"11px 15px",background:T.white,borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+      <div style={{padding:"11px 15px",background:T.white,borderBottom:('1px solid ' + T.border),display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
         {!reorderMode && (
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 ค้นหาเมนู..."
-            style={{flex:1,padding:"7px 12px",borderRadius:9,border:`1px solid ${T.border}`,fontSize:13,background:T.cream,boxSizing:"border-box",outline:"none"}}/>
+            style={{flex:1,padding:"7px 12px",borderRadius:9,border:('1px solid ' + T.border),fontSize:13,background:T.cream,boxSizing:"border-box",outline:"none"}}/>
         )}
         {reorderMode && <span style={{flex:1,fontSize:12,color:T.caramel,fontWeight:700}}>☰ กดค้างที่การ์ดเพื่อลาก — จัดลำดับได้อิสระ</span>}
         <button onClick={()=>setReorderMode(r=>!r)}
-          style={{padding:"8px 14px",background:reorderMode?T.mint:T.cream,color:reorderMode?T.white:T.inkMid,border:`1px solid ${reorderMode?T.mint:T.border}`,borderRadius:9,cursor:"pointer",fontWeight:700,fontSize:12,whiteSpace:"nowrap",flexShrink:0,transition:"all 0.15s"}}>
+          style={{padding:"8px 14px",background:reorderMode?T.mint:T.cream,color:reorderMode?T.white:T.inkMid,border:('1px solid ' + (reorderMode?T.mint:T.border)),borderRadius:9,cursor:"pointer",fontWeight:700,fontSize:12,whiteSpace:"nowrap",flexShrink:0,transition:"all 0.15s"}}>
           {reorderMode?"✓ เสร็จแล้ว":"⇅ เรียงลำดับ"}
         </button>
         {!reorderMode && (
@@ -2159,10 +2487,10 @@ function MenuManagerView({ menuItems, setMenuItems }){
       </div>
 
       {/* Category tabs */}
-      <div style={{padding:"8px 15px 0",background:T.white,borderBottom:`1px solid ${T.border}`,display:"flex",gap:5,overflowX:"auto",paddingBottom:9,flexShrink:0}}>
+      <div style={{padding:"8px 15px 0",background:T.white,borderBottom:('1px solid ' + T.border),display:"flex",gap:5,overflowX:"auto",paddingBottom:9,flexShrink:0}}>
         {CATS.map(c=>(
           <button key={c} onClick={()=>setCat(c)} style={{padding:"5px 12px",borderRadius:20,border:"none",cursor:"pointer",fontWeight:600,fontSize:12,whiteSpace:"nowrap",background:cat===c?T.caramel:T.cream,color:cat===c?T.white:T.inkMid,transition:"all 0.15s"}}>
-            {c}{c!=="ทั้งหมด"&&` (${menuItems.filter(m=>m.cat===c).length})`}
+            {c}{c!=="ทั้งหมด"&&(" (" + menuItems.filter(m=>m.cat===c).length + ")")}
           </button>
         ))}
       </div>
@@ -2177,8 +2505,8 @@ function MenuManagerView({ menuItems, setMenuItems }){
               {...(reorderMode ? dragHandleProps(item.id) : {})}
               onClick={reorderMode ? undefined : ()=>setEditItem(item)}
               style={{
-                background:T.white,borderRadius:13,overflow:"hidden",
-                border: isDragging?`2px dashed ${T.caramel}`:`1px solid ${T.border}`,
+                background:T.white,                borderRadius:13,overflow:"hidden",
+                border: isDragging?('2px dashed ' + T.caramel):('1px solid ' + T.border),
                 boxShadow: isDragging?"0 12px 40px rgba(200,129,58,0.35)":"0 1px 5px rgba(0,0,0,0.05)",
                 opacity: isDragging?0.5:item.available===false?0.55:1,
                 cursor: reorderMode?"grab":"pointer",
@@ -2298,8 +2626,8 @@ function CategoryManager({ categories, catInfo, menuItems, onChange }){
   return(
     <div style={{display:"flex",flexDirection:"column",gap:9}}>
       {notice&&<ConfirmDialog message={notice} confirmLabel="เข้าใจแล้ว" onConfirm={()=>setNotice(null)} onCancel={null}/>}
-      {confirmDelete&&<ConfirmDialog title={`ลบหมวดหมู่ "${confirmDelete.name}"?`}
-        message={`มีเมนู ${confirmDelete.affected} รายการ\nรายการเหล่านี้จะถูกย้ายไปที่ "${confirmDelete.fallback}"\nดำเนินการต่อ?`}
+      {confirmDelete&&<ConfirmDialog title={("ลบหมวดหมู่ \"" + confirmDelete.name + "\"?")}
+        message={("มีเมนู " + confirmDelete.affected + " รายการ\nรายการเหล่านี้จะถูกย้ายไปที่ \"" + confirmDelete.fallback + "\"\nดำเนินการต่อ?")}
         confirmLabel="ลบหมวดหมู่" danger
         onConfirm={()=>{ doDeleteCategory(confirmDelete.name, confirmDelete.affected, confirmDelete.fallback); setConfirmDelete(null); }}
         onCancel={()=>setConfirmDelete(null)}/>}
@@ -2308,7 +2636,7 @@ function CategoryManager({ categories, catInfo, menuItems, onChange }){
         const cnt=countItems(name);
         const isEditing=editingIdx===idx;
         return(
-          <div key={name} style={{background:T.white,borderRadius:12,border:`1px solid ${T.border}`,padding:"12px 14px"}}>
+          <div key={name} style={{background:T.white,borderRadius:12,border:('1px solid ' + T.border),padding:"12px 14px"}}>
             {!isEditing ? (
               <div style={{display:"flex",alignItems:"center",gap:11}}>
                 <div style={{display:"flex",flexDirection:"column",gap:2,flexShrink:0}}>
@@ -2320,22 +2648,22 @@ function CategoryManager({ categories, catInfo, menuItems, onChange }){
                   <div style={{fontSize:14,fontWeight:700,color:T.ink}}>{name}</div>
                   <div style={{fontSize:11,color:T.inkLight}}>{cnt} เมนู</div>
                 </div>
-                <button onClick={()=>startEdit(idx,name)} style={{padding:"6px 12px",border:`1px solid ${T.border}`,borderRadius:8,background:T.cream,cursor:"pointer",fontSize:12,fontWeight:600,color:T.inkMid,flexShrink:0}}>แก้ไข</button>
+                <button onClick={()=>startEdit(idx,name)} style={{padding:"6px 12px",border:('1px solid ' + T.border),borderRadius:8,background:T.cream,cursor:"pointer",fontSize:12,fontWeight:600,color:T.inkMid,flexShrink:0}}>แก้ไข</button>
                 <button onClick={()=>deleteCategory(name)} style={{padding:"6px 10px",border:"none",borderRadius:8,background:"#FFF0F0",cursor:"pointer",fontSize:12,fontWeight:600,color:T.red,flexShrink:0}}>ลบ</button>
               </div>
             ):(
               <div>
                 <div style={{display:"flex",gap:8,marginBottom:9}}>
                   <input value={editName} onChange={e=>setEditName(e.target.value)} placeholder="ชื่อหมวดหมู่"
-                    style={{flex:1,padding:"8px 11px",borderRadius:9,border:`1.5px solid ${T.caramel}`,fontSize:13,fontWeight:600,boxSizing:"border-box"}}/>
+                    style={{flex:1,padding:"8px 11px",borderRadius:9,border:('1.5px solid ' + T.caramel),fontSize:13,fontWeight:600,boxSizing:"border-box"}}/>
                 </div>
                 <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
                   {EMOJI_PICK.map(e=>(
-                    <button key={e} onClick={()=>setEditIcon(e)} style={{width:32,height:32,borderRadius:8,border:editIcon===e?`2px solid ${T.caramel}`:`1px solid ${T.border}`,background:editIcon===e?"#FFF8EE":T.white,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{e}</button>
+                    <button key={e} onClick={()=>setEditIcon(e)} style={{width:32,height:32,borderRadius:8,border:editIcon===e?('2px solid ' + T.caramel):('1px solid ' + T.border),background:editIcon===e?"#FFF8EE":T.white,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{e}</button>
                   ))}
                 </div>
                 <div style={{display:"flex",gap:7}}>
-                  <button onClick={()=>setEditingIdx(null)} style={{flex:1,padding:"8px",borderRadius:8,border:`1px solid ${T.border}`,background:T.cream,cursor:"pointer",fontSize:12,fontWeight:600}}>ยกเลิก</button>
+                  <button onClick={()=>setEditingIdx(null)} style={{flex:1,padding:"8px",borderRadius:8,border:('1px solid ' + T.border),background:T.cream,cursor:"pointer",fontSize:12,fontWeight:600}}>ยกเลิก</button>
                   <button onClick={()=>saveEdit(name)} style={{flex:2,padding:"8px",borderRadius:8,border:"none",background:T.coffee,color:T.white,cursor:"pointer",fontSize:12,fontWeight:700}}>💾 บันทึก</button>
                 </div>
               </div>
@@ -2346,21 +2674,21 @@ function CategoryManager({ categories, catInfo, menuItems, onChange }){
 
       {/* Add new category */}
       {adding ? (
-        <div style={{background:"#FFF8EE",borderRadius:12,border:`1.5px solid ${T.caramel}`,padding:"12px 14px"}}>
+        <div style={{background:"#FFF8EE",borderRadius:12,border:('1.5px solid ' + T.caramel),padding:"12px 14px"}}>
           <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="ชื่อหมวดหมู่ใหม่ เช่น สมูทตี้"
-            style={{width:"100%",padding:"8px 11px",borderRadius:9,border:`1.5px solid ${T.border}`,fontSize:13,fontWeight:600,boxSizing:"border-box",marginBottom:9}}/>
+            style={{width:"100%",padding:"8px 11px",borderRadius:9,border:('1.5px solid ' + T.border),fontSize:13,fontWeight:600,boxSizing:"border-box",marginBottom:9}}/>
           <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
             {EMOJI_PICK.map(e=>(
-              <button key={e} onClick={()=>setNewIcon(e)} style={{width:32,height:32,borderRadius:8,border:newIcon===e?`2px solid ${T.caramel}`:`1px solid ${T.border}`,background:newIcon===e?T.white:T.white,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{e}</button>
+              <button key={e} onClick={()=>setNewIcon(e)} style={{width:32,height:32,borderRadius:8,border:newIcon===e?('2px solid ' + T.caramel):('1px solid ' + T.border),background:newIcon===e?T.white:T.white,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{e}</button>
             ))}
           </div>
           <div style={{display:"flex",gap:7}}>
-            <button onClick={()=>{setAdding(false);setNewName("");}} style={{flex:1,padding:"8px",borderRadius:8,border:`1px solid ${T.border}`,background:T.white,cursor:"pointer",fontSize:12,fontWeight:600}}>ยกเลิก</button>
+            <button onClick={()=>{setAdding(false);setNewName("");}} style={{flex:1,padding:"8px",borderRadius:8,border:('1px solid ' + T.border),background:T.white,cursor:"pointer",fontSize:12,fontWeight:600}}>ยกเลิก</button>
             <button disabled={!newName.trim()} onClick={addCategory} style={{flex:2,padding:"8px",borderRadius:8,border:"none",background:newName.trim()?T.caramel:T.border,color:T.white,cursor:newName.trim()?"pointer":"not-allowed",fontSize:12,fontWeight:700}}>✅ เพิ่มหมวดหมู่</button>
           </div>
         </div>
       ):(
-        <button onClick={()=>setAdding(true)} style={{padding:"12px",borderRadius:12,border:`2px dashed ${T.caramel}`,background:"#FFF8EE",cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
+        <button onClick={()=>setAdding(true)} style={{padding:"12px",borderRadius:12,border:('2px dashed ' + T.caramel),background:"#FFF8EE",cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
           + เพิ่มหมวดหมู่ใหม่
         </button>
       )}
@@ -2389,19 +2717,19 @@ function ModifierGroupCard({ group, onUpdate, onDelete }){
   }
 
   return(
-    <div style={{background:T.white,borderRadius:13,border:`1px solid ${T.border}`,padding:"14px 16px"}}>
+    <div style={{background:T.white,borderRadius:13,border:('1px solid ' + T.border),padding:"14px 16px"}}>
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:12}}>
         {editing ? (
           <input value={label} onChange={e=>setLabel(e.target.value)} autoFocus
-            style={{flex:1,padding:"6px 10px",borderRadius:8,border:`1.5px solid ${T.caramel}`,fontSize:14,fontWeight:700,boxSizing:"border-box"}}/>
+            style={{flex:1,padding:"6px 10px",borderRadius:8,border:('1.5px solid ' + T.caramel),fontSize:14,fontWeight:700,boxSizing:"border-box"}}/>
         ):(
           <div style={{flex:1,fontSize:15,fontWeight:700,color:T.ink}}>{group.label}</div>
         )}
         {editing ? (
           <button onClick={saveLabel} style={{padding:"6px 12px",border:"none",borderRadius:8,background:T.mint,color:T.white,cursor:"pointer",fontSize:12,fontWeight:700,flexShrink:0}}>✓ บันทึก</button>
         ):(
-          <button onClick={()=>setEditing(true)} style={{padding:"5px 11px",border:`1px solid ${T.border}`,borderRadius:8,background:T.cream,cursor:"pointer",fontSize:11,fontWeight:600,color:T.inkMid,flexShrink:0}}>เปลี่ยนชื่อ</button>
+          <button onClick={()=>setEditing(true)} style={{padding:"5px 11px",border:('1px solid ' + T.border),borderRadius:8,background:T.cream,cursor:"pointer",fontSize:11,fontWeight:600,color:T.inkMid,flexShrink:0}}>เปลี่ยนชื่อ</button>
         )}
         <button onClick={onDelete} style={{padding:"5px 10px",border:"none",borderRadius:8,background:"#FFF0F0",cursor:"pointer",fontSize:11,fontWeight:600,color:T.red,flexShrink:0}}>🗑 ลบกลุ่ม</button>
       </div>
@@ -2416,9 +2744,9 @@ function ModifierGroupCard({ group, onUpdate, onDelete }){
         <div style={{display:"flex",alignItems:"center",gap:7,background:T.cream,borderRadius:9,padding:"5px 10px"}}>
           <span style={{fontSize:12,color:T.inkMid,whiteSpace:"nowrap"}}>เลือกได้สูงสุด</span>
           <button onClick={()=>onUpdate({...group,maxSelect:Math.max(1,(group.maxSelect||1)-1),multi:(group.maxSelect||1)-1>1})}
-            style={{width:24,height:24,borderRadius:6,border:`1px solid ${T.border}`,background:T.white,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+            style={{width:24,height:24,borderRadius:6,border:('1px solid ' + T.border),background:T.white,cursor:"pointer",fontSize:14,fontWeight:700,color:T.ink,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
           <div style={{minWidth:28,textAlign:"center",fontSize:14,fontWeight:700,color:(group.maxSelect||1)>1?T.caramel:T.ink}}>
-            {(group.maxSelect||1)===1?"1":(group.maxSelect>=group.options.length?"ไม่จำกัด":String(group.maxSelect||1))}
+            {((group.maxSelect||1)===1?"1":(group.maxSelect>=group.options.length?"ไม่จำกัด":String(group.maxSelect||1)))}
           </div>
           <button onClick={()=>{
             const cur=group.maxSelect||1;
@@ -2426,7 +2754,7 @@ function ModifierGroupCard({ group, onUpdate, onDelete }){
             onUpdate({...group,maxSelect:next,multi:next>1});
           }} style={{width:24,height:24,borderRadius:6,border:"none",background:T.caramel,cursor:"pointer",fontSize:14,fontWeight:700,color:T.white,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
           <span style={{fontSize:11,color:T.inkLight,whiteSpace:"nowrap"}}>
-            {(group.maxSelect||1)===1?"(เดี่ยว)":(group.maxSelect||1)>=group.options.length?"(ทั้งหมด)":`/ ${group.options.length}`}
+            {((group.maxSelect||1)===1?"(เดี่ยว)":((group.maxSelect||1)>=group.options.length?"(ทั้งหมด)":("/ " + group.options.length)))}
           </span>
         </div>
       </div>
@@ -2434,7 +2762,7 @@ function ModifierGroupCard({ group, onUpdate, onDelete }){
       {/* Options — drag to reorder */}
       <DraggableOptionList options={group.options} onReorder={opts=>onUpdate({...group,options:opts})}
         onUpdate={updateOpt} onRemove={removeOpt}/>
-      <button onClick={addOpt} style={{padding:"8px",borderRadius:9,border:`1.5px dashed ${T.caramelLight}`,background:"transparent",cursor:"pointer",fontSize:12,fontWeight:700,color:T.caramel}}>
+      <button onClick={addOpt} style={{padding:"8px",borderRadius:9,border:('1.5px dashed ' + T.caramelLight),background:"transparent",cursor:"pointer",fontSize:12,fontWeight:700,color:T.caramel}}>
         + เพิ่มตัวเลือก
       </button>
       {notice&&<ConfirmDialog message={notice} confirmLabel="เข้าใจแล้ว" onConfirm={()=>setNotice(null)} onCancel={null}/>}
@@ -2462,9 +2790,9 @@ function DraggableGroupList({ groups, setGroups, onUpdate, onDelete }){
         <div key={g.id} style={{position:"relative"}}>
           <div style={{position:"absolute",top:10,right:10,display:"flex",gap:4,zIndex:10}}>
             <button onClick={()=>move(idx,-1)} disabled={idx===0}
-              style={{width:22,height:22,border:`1px solid ${T.border}`,borderRadius:5,background:T.cream,cursor:idx===0?"default":"pointer",fontSize:11,color:T.inkMid,display:"flex",alignItems:"center",justifyContent:"center"}}>▲</button>
+              style={{width:22,height:22,border:('1px solid ' + T.border),borderRadius:5,background:T.cream,cursor:idx===0?"default":"pointer",fontSize:11,color:T.inkMid,display:"flex",alignItems:"center",justifyContent:"center"}}>▲</button>
             <button onClick={()=>move(idx,1)} disabled={idx===groups.length-1}
-              style={{width:22,height:22,border:`1px solid ${T.border}`,borderRadius:5,background:T.cream,cursor:idx===groups.length-1?"default":"pointer",fontSize:11,color:T.inkMid,display:"flex",alignItems:"center",justifyContent:"center"}}>▼</button>
+              style={{width:22,height:22,border:('1px solid ' + T.border),borderRadius:5,background:T.cream,cursor:idx===groups.length-1?"default":"pointer",fontSize:11,color:T.inkMid,display:"flex",alignItems:"center",justifyContent:"center"}}>▼</button>
           </div>
           <ModifierGroupCard key={g.id} group={g} onUpdate={onUpdate} onDelete={()=>onDelete(g.id)}/>
         </div>
@@ -2508,16 +2836,16 @@ function ManagementView({ menuItems, setMenuItems }){
   return(
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:T.cream}}>
       {confirmDeleteGroup&&<ConfirmDialog title="ลบกลุ่มตัวเลือก?"
-        message={`กลุ่มนี้ถูกใช้อยู่ใน ${confirmDeleteGroup.usedByCount} เมนู\nหากลบ เมนูเหล่านั้นจะไม่มีตัวเลือกนี้อีกต่อไป\nดำเนินการต่อ?`}
+        message={("กลุ่มนี้ถูกใช้อยู่ใน " + confirmDeleteGroup.usedByCount + " เมนู\nหากลบ เมนูเหล่านั้นจะไม่มีตัวเลือกนี้อีกต่อไป\nดำเนินการต่อ?")}
         confirmLabel="ลบกลุ่ม" danger
         onConfirm={()=>{ doDeleteGroup(confirmDeleteGroup.gid); setConfirmDeleteGroup(null); }}
         onCancel={()=>setConfirmDeleteGroup(null)}/>}
       {/* Tabs */}
-      <div style={{display:"flex",background:T.white,borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+      <div style={{display:"flex",background:T.white,borderBottom:('1px solid ' + T.border),flexShrink:0}}>
         {[{id:"modifiers",icon:"🏷️",label:"ตัวเลือกรอง"},{id:"categories",icon:"🗂️",label:"กลุ่มเมนู"}].map(t=>(
           <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"12px",border:"none",cursor:"pointer",fontWeight:700,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center",gap:6,
             background:tab===t.id?T.cream:T.white, color:tab===t.id?T.caramel:T.inkMid,
-            borderBottom:tab===t.id?`3px solid ${T.caramel}`:"3px solid transparent",transition:"all 0.15s"}}>
+            borderBottom:tab===t.id?('3px solid ' + T.caramel):"3px solid transparent",transition:"all 0.15s"}}>
             <span>{t.icon}</span>{t.label}
           </button>
         ))}
@@ -2535,7 +2863,7 @@ function ManagementView({ menuItems, setMenuItems }){
             </div>
             <DraggableGroupList groups={modGroups} setGroups={setModGroups}
               onUpdate={updateGroup} onDelete={deleteGroup}/>
-            <button onClick={addGroup} style={{padding:"13px",borderRadius:12,border:`2px dashed ${T.caramel}`,background:"#FFF8EE",cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
+            <button onClick={addGroup} style={{padding:"13px",borderRadius:12,border:('2px dashed ' + T.caramel),background:"#FFF8EE",cursor:"pointer",fontSize:13,fontWeight:700,color:T.caramel}}>
               + เพิ่มกลุ่มตัวเลือกใหม่
             </button>
           </div>
@@ -2558,6 +2886,7 @@ function App(){
   const [displaySettings,setDisplaySettings]=usePersistentState("displaySettings", {
     slideshowImages:[], slideshowInterval:5, showDateTime:true, bgColor:"#3B1F0E", accentColor:"#C8813A",
   });
+  const [githubSettings,setGithubSettings]=usePersistentState("githubSettings", { token: "", owner: "Prat-ppw", repo: "Comeon-Pos", autoSync: true });
   const [orders,setOrders]=usePersistentState("orders", []); // real completed-order history, newest first
   const [heldOrders,setHeldOrders]=usePersistentState("heldOrders", []); // parked bills: taken but not yet paid
   const [activeHeldId,setActiveHeldId]=useState(null); // which held bill the current cart is editing
@@ -2583,7 +2912,13 @@ function App(){
 
   function setCategoriesAndInfo(newCats,newInfo){ setCategories(newCats); setCatInfo(newInfo); }
 
-  function addOrder(order){ setOrders(prev=>[order, ...prev].slice(0,1000)); }
+  function addOrder(order){
+    const newOrders = [order, ...orders].slice(0,1000);
+    setOrders(newOrders);
+    if (githubSettings.autoSync) {
+      pushToGithub("sales-report.json", { lastUpdate: new Date().toISOString(), totalOrders: newOrders.length, orders: newOrders }, githubSettings);
+    }
+  }
   function updateOrderStatus(orderId, status){ setOrders(prev=>prev.map(o=>o.id===orderId?{...o,status}:o)); }
 
   function holdOrder(label, items){
@@ -2611,9 +2946,9 @@ function App(){
   }
 
   const appCtxValue = useMemo(()=>({
-    categories, catInfo, modGroups, modGroupsMap,
-    setCategoriesAndInfo, setModGroups,
-  }), [categories, catInfo, modGroups, modGroupsMap]);
+    categories, catInfo, modGroups, modGroupsMap, githubSettings,
+    setCategoriesAndInfo, setModGroups, setMenuItems, setOrders
+  }), [categories, catInfo, modGroups, modGroupsMap, githubSettings, setMenuItems, setOrders]);
 
   useEffect(()=>{ const t=setInterval(()=>setNow(new Date()),30000); return()=>clearInterval(t); },[]);
   useEffect(()=>{ const t=setInterval(()=>setCustomerActive(!!(customerWinRef.current&&!customerWinRef.current.closed)),1000); return()=>clearInterval(t); },[]);
@@ -2624,7 +2959,11 @@ function App(){
     const html = buildCustomerHTML(modGroupsJSON, false, displaySettings||{});
     const blob=new Blob([html],{type:"text/html"});
     const url=URL.createObjectURL(blob);
-    const w=window.open(url,"customerDisplay","width=680,height=960,toolbar=no,menubar=no,scrollbars=yes,resizable=yes");
+
+    // สำหรับ Sunmi D2s Plus พยายามเปิดในหน้าจอที่ 2
+    // หาก Browser รองรับ screen.availLeft ที่เป็นบวก (หน้าจอเสริม)
+    const left = window.screen.width;
+    const w=window.open(url,"customerDisplay","width=1024,height=600,left=" + left + ",top=0,toolbar=no,menubar=no,scrollbars=yes,resizable=yes");
     customerWinRef.current=w;
   }
 
@@ -2644,23 +2983,25 @@ function App(){
         settings={printerSettings}
         taxSettings={taxSettings}
         displaySettings={displaySettings}
+        githubSettings={githubSettings}
         onSave={setPrinterSettings}
         onSaveTax={setTaxSettings}
         onSaveDisplay={setDisplaySettings}
+        onSaveGithub={setGithubSettings}
         onClose={()=>setShowSettingsModal(false)}/>}
       {confirmResumeApp&&<ConfirmDialog title="แทนที่รายการปัจจุบัน?"
-        message={`ตะกร้าตอนนี้ยังมีรายการที่ยังไม่ได้บันทึก\nเปิดบิล "${confirmResumeApp.label}" จะแทนที่รายการปัจจุบันทั้งหมด ดำเนินการต่อ?`}
+        message={("ตะกร้าตอนนี้ยังมีรายการที่ยังไม่ได้บันทึก\nเปิดบิล \"" + confirmResumeApp.label + "\" จะแทนที่รายการปัจจุบันทั้งหมด ดำเนินการต่อ?")}
         confirmLabel="เปิดบิลนี้" danger onConfirm={()=>doResumeHeld(confirmResumeApp)} onCancel={()=>setConfirmResumeApp(null)}/>}
       <Sidebar view={view} setView={setView} cartCount={cart.length} onSettings={()=>setShowSettingsModal(true)} heldCount={heldOrders.length}/>
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
         {/* Topbar */}
-        <div style={{height:48,background:T.white,borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",padding:"0 16px",justifyContent:"space-between",flexShrink:0}}>
+        <div style={{height:48,background:T.white,borderBottom:('1px solid ' + T.border),display:"flex",alignItems:"center",padding:"0 16px",justifyContent:"space-between",flexShrink:0}}>
           <div style={{fontSize:14,fontWeight:700,color:T.ink}}>{viewLabel[view]}</div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:11,color:T.inkMid}}>{dateStr}</span>
             <span style={{fontSize:12,fontWeight:600,color:T.caramel}}>{timeStr} น.</span>
             {txBadge.length>0&&(
-              <button onClick={()=>{ setShowSettingsModal(true); }} style={{fontSize:11,background:"#FFF5EA",color:T.caramel,padding:"3px 8px",borderRadius:8,fontWeight:700,border:`1px solid ${T.caramelLight}`,cursor:"pointer"}}>
+              <button onClick={()=>{ setShowSettingsModal(true); }} style={{fontSize:11,background:"#FFF5EA",color:T.caramel,padding:"3px 8px",borderRadius:8,fontWeight:700,border:('1px solid ' + T.caramelLight),cursor:"pointer"}}>
                 💰 {txBadge.join(" + ")}
               </button>
             )}
@@ -2674,7 +3015,7 @@ function App(){
                 🍳 {kitchenPrinterSettings.type==="usb"?"USB":kitchenPrinterSettings.type==="bluetooth"?"BT":"Serial"}
               </span>
             )}
-            <button onClick={openCustomerDisplay} style={{padding:"5px 10px",border:`1.5px solid ${T.caramel}`,borderRadius:7,background:customerActive?T.caramel:T.white,color:customerActive?T.white:T.caramel,cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4}}>
+            <button onClick={openCustomerDisplay} style={{padding:"5px 10px",border:('1.5px solid ' + T.caramel),borderRadius:7,background:customerActive?T.caramel:T.white,color:customerActive?T.white:T.caramel,cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4}}>
               🖥 {customerActive?"จอลูกค้า ✓":"เปิดจอลูกค้า"}
             </button>
             <div style={{width:28,height:28,borderRadius:"50%",background:T.coffee,display:"flex",alignItems:"center",justifyContent:"center",color:T.caramelLight,fontSize:12,fontWeight:700}}>K</div>
