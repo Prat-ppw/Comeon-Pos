@@ -1,0 +1,52 @@
+name: Sync & Update Android Project
+
+on:
+  push:                   # ทำงานทันทีที่มีการ Push ไฟล์ใหม่ขึ้น GitHub
+  pull_request:           # ทำงานเมื่อมีการเปิดหรืออัปเดต Pull Request
+  workflow_dispatch:      # ยังคงปุ่มกด Sync manually ไว้ใน GitHub UI
+
+jobs:
+  sync-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout code ───────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Node.js ───────────────────────────────────────
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      # ── 3. Install npm dependencies ────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 4. Build web assets (Vite) ─────────────────────────────
+      - name: Build web app
+        run: npm run build
+
+      # ── 5. Sync Capacitor Android ──────────────────────────────
+      - name: Capacitor Sync
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap copy android
+          npx cap sync android
+
+      # ── 6. Apply Sunmi D2s Plus Patches ────────────────────────
+      - name: Apply Sunmi Patches
+        run: |
+          mkdir -p android/app/src/main/res/values
+          if [ -f "android-config/AndroidManifest-patch.xml" ]; then
+            cp android-config/AndroidManifest-patch.xml android/app/src/main/AndroidManifest.xml
+          fi
+          if [ -f "android-config/styles-patch.xml" ]; then
+            cp android-config/styles-patch.xml android/app/src/main/res/values/styles.xml
+          fi
