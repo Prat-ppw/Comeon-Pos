@@ -39,7 +39,7 @@ jobs:
       - name: Build web app
         run: npm run build || true
 
-      - name: Capacitor add android
+      - name: Capacitor add android (ถ้ายังไม่มี)
         run: |
           if [ ! -d "android" ]; then
             npx cap add android
@@ -64,31 +64,37 @@ jobs:
           cd android
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: brew-pos-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
-
-      - name: Build release APK (เฉพาะ tag v* และมี Secrets ครบ)
-        if: startsWith(github.ref, 'refs/tags/v') && secrets.KEYSTORE_BASE64 != ''
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Create Temporary Keystore & Build Release APK
         run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > android/app/brew-pos.keystore
+          # สร้าง Keystore ชั่วคราวสำหรับการ Sign APK
+          keytool -genkeypair -v \
+            -keystore android/app/auto-release.keystore \
+            -alias brewkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass brewpos1234 \
+            -keypass brewpos1234 \
+            -dname "CN=BrewPOS, OU=POS, O=Brew, L=BKK, C=TH"
+
           cd android
           ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=brew-pos.keystore \
-            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
-            -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
-            -Pandroid.injected.signing.key.password=$KEY_PASSWORD \
+            -Pandroid.injected.signing.store.file=auto-release.keystore \
+            -Pandroid.injected.signing.store.password=brewpos1234 \
+            -Pandroid.injected.signing.key.alias=brewkey \
+            -Pandroid.injected.signing.key.password=brewpos1234 \
             --no-daemon
 
-      - name: Create GitHub Release (เฉพาะ tag v*)
+      - name: Upload Debug & Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: brew-pos-apks
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+
+      - name: Create GitHub Release (เฉพาะตอน Push Tag v*)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
@@ -97,5 +103,5 @@ jobs:
             android/app/build/outputs/apk/debug/app-debug.apk
           body: |
             ## BREW POS ${{ github.ref_name }}
-            - **app-release.apk** — ติดตั้งบน Sunmi T2s (signed)
-            - **app-debug.apk** — ทดสอบ
+            - **app-release.apk** — ติดตั้งบนเครื่อง POS / Sunmi T2s
+            - **app-debug.apk** — เวอร์ชันทดสอบ
