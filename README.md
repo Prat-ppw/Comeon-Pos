@@ -1,3 +1,7 @@
+## WEB APP
+
+https://comeon-pos.vercel.app
+
 # 📱 BREW POS — Sunmi D2s Plus & Cloud Sync (GitHub)
 
 ระบบบริหารจัดการหน้าร้าน (POS) ออกแบบมาเพื่อรันบน Sunmi D2s Plus โดยเฉพาะ พร้อมระบบซิงค์ข้อมูลผ่าน GitHub Cloud เพื่อเช็คยอดและจัดการเมนูจากมือถือได้ทุกที่
