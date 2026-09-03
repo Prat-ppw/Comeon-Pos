@@ -1,0 +1,112 @@
+name: Build BREW POS APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # เพิ่ม write permission สำหรับ create release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # ไม่ใส่ cache: npm เพราะยังไม่มี package-lock.json
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm install   # ใช้ install แทน ci — ไม่ต้องการ lock file
+
+      - name: Generate package-lock.json for next time
+        run: |
+          # commit lock file กลับเพื่อให้ cache ทำงานครั้งหน้า
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "ci: add package-lock.json [skip ci]"
+          git push 2>/dev/null || true
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Capacitor add android (ถ้ายังไม่มี android folder)
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+
+      - name: Capacitor sync
+        run: npx cap sync android
+
+      - name: Apply Sunmi T2s Android config
+        run: |
+          # AndroidManifest.xml
+          cp android-config/AndroidManifest-patch.xml android/app/src/main/AndroidManifest.xml
+          # styles.xml
+          cp android-config/styles-patch.xml android/app/src/main/res/values/styles.xml
+          echo "Applied Sunmi T2s config"
+
+      - name: Set gradlew permission
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK
+        run: |
+          cd android
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: brew-pos-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Build release APK (เฉพาะ tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/brew-pos.keystore
+          cd android
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=app/brew-pos.keystore \
+            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
+            -Pandroid.injected.signing.key.password=$KEY_PASSWORD \
+            --no-daemon
+
+      - name: Create GitHub Release (เฉพาะ tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/debug/app-debug.apk
+          body: |
+            ## BREW POS ${{ github.ref_name }}
+            - **app-release.apk** — ติดตั้งบน Sunmi T2s (signed)
+            - **app-debug.apk** — ทดสอบ
+
