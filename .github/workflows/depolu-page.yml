@@ -27,8 +27,6 @@ jobs:
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true   # เปิด GitHub Pages อัตโนมัติ ไม่ต้องตั้งค่าใน Settings
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
