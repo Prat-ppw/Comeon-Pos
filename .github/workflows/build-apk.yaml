@@ -66,9 +66,12 @@ jobs:
 
       - name: Create Temporary Keystore & Build Release APK
         run: |
+          # กำหนด Absolute Path ให้ไฟล์ Keystore เพื่อป้องกัน Path เพี้ยน
+          KEYSTORE_PATH="$GITHUB_WORKSPACE/android/app/auto-release.keystore"
+
           # สร้าง Keystore ชั่วคราวสำหรับการ Sign APK
           keytool -genkeypair -v \
-            -keystore android/app/auto-release.keystore \
+            -keystore "$KEYSTORE_PATH" \
             -alias brewkey \
             -keyalg RSA \
             -keysize 2048 \
@@ -77,9 +80,10 @@ jobs:
             -keypass brewpos1234 \
             -dname "CN=BrewPOS, OU=POS, O=Brew, L=BKK, C=TH"
 
+          # สั่ง Build โดยส่ง Full Path ให้ Gradle
           cd android
           ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=auto-release.keystore \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
             -Pandroid.injected.signing.store.password=brewpos1234 \
             -Pandroid.injected.signing.key.alias=brewkey \
             -Pandroid.injected.signing.key.password=brewpos1234 \
