@@ -1,0 +1,6 @@
+{
+  "appId": "com.comeonpos.app",
+  "appName": "Comeon POS",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
