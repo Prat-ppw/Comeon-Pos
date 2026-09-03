@@ -1,9 +1,3 @@
-# clone หรือสร้าง folder ใหม่
-cd comeon-pos
-
-git init
-git add .
-git commit -m "Initial: COME ON  POS"
-git branch -M main
-git remote add origin https://github.com/Prat-ppw/Comeon-Pos
+git init && git add . && git commit -m "init"
+git remote add origin https://github.com/Prat-ppw/Comeon-Pos.git
 git push -u origin main
