@@ -1,5 +1,5 @@
 # clone หรือสร้าง folder ใหม่
-cd brew-pos
+cd comeon-pos
 
 git init
 git add .
