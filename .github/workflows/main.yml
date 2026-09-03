@@ -1,1 +1,9 @@
+# clone หรือสร้าง folder ใหม่
+cd brew-pos
 
+git init
+git add .
+git commit -m "Initial: COME ON  POS"
+git branch -M main
+git remote add origin https://github.com/Prat-ppw/Comeon-Pos
+git push -u origin main
